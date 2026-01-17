@@ -1,181 +1,158 @@
 import re
-from typing import Tuple
+from typing import Dict, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from catboost import CatBoostClassifier
 from torch_geometric.data import Batch, Data
 from tqdm import tqdm
+from xgboost import XGBClassifier
 
-from datatools.feature import FeatureEngineer
-from datatools.utils import filter_features_and_labels
-from models.gat import GAT
+from datatools.config import FIELD_SIZE, TASK_CONFIG
+from datatools.match import Match
+from datatools.utils import (
+    filter_features_and_labels,
+    find_active_players,
+    player_sort_key,
+)
+from models.gnn import GNN
 
 
-def find_active_players(eng: FeatureEngineer, action_index: int, include_goals=False) -> dict:
-    frame = eng.actions.at[action_index, "frame"]
-    action_type = eng.actions.at[action_index, "action_type"]
-    snapshot = eng.traces.loc[frame:frame].dropna(axis=1).copy()
+def inference_boost(
+    match: Match,
+    model: Union[XGBClassifier, CatBoostClassifier],
+    post_action: bool = False,
+    pad_own_half: bool = True,  # Zero-pad xG values for events occurring in the team's own half
+    event_indices: pd.Index = None,
+) -> pd.Series:
+    features = match.tabular_features_0 if not post_action else match.tabular_features_1
 
-    if include_goals:
-        home_players = [c[:-2] for c in snapshot.columns if re.match(r"home_.*_x", c)]
-        away_players = [c[:-2] for c in snapshot.columns if re.match(r"away_.*_x", c)]
+    event_indices = event_indices if event_indices is not None else match.actions.index
+    mask = match.actions.index.isin(event_indices)
+    features = features.numpy()[mask, :20]
+
+    probs = model.predict_proba(features)[:, 1]
+    if pad_own_half:
+        own_half_mask = features[:, 2] < FIELD_SIZE[0] / 2
+        probs[own_half_mask] = 0.0
+
+    return pd.Series(probs, index=event_indices, dtype=float)
+
+
+def inference_gnn(
+    match: Match,
+    model: GNN,
+    device: str = "cuda",
+    post_action: bool = False,
+    event_indices: pd.Index = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    gnn_task = TASK_CONFIG.at[model.args["task"], "gnn_task"]
+    include_goals = TASK_CONFIG.at[model.args["task"], "include_goals"]
+    out_filter = TASK_CONFIG.at[model.args["task"], "out_filter"]
+
+    if not post_action:
+        graphs, labels = filter_features_and_labels(match.graph_features_0, match.labels, model.args, event_indices)
     else:
-        home_players = [c[:-2] for c in snapshot.columns if re.match(r"home_\d+_x", c)]
-        away_players = [c[:-2] for c in snapshot.columns if re.match(r"away_\d+_x", c)]
+        graphs, labels = filter_features_and_labels(match.graph_features_1, match.labels, model.args, event_indices)
 
-    possessor = eng.actions.at[action_index, "object_id"]
-    if possessor[:4] == "home":
-        players = [home_players, away_players] if action_type != "tackle" else [away_players, home_players]
-    else:
-        players = [away_players, home_players] if action_type != "tackle" else [home_players, away_players]
+    graphs = Batch.from_data_list(graphs).to(device)
+    graphs.x = graphs.x[:, : model.args["node_in_dim"]]
 
-    return players
-
-
-def inference(eng: FeatureEngineer, model: GAT, device="cuda") -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # For intent, receiver, scoring/conceding, {intent/receiver}_{scoring/conceding}, shot_blocking
-
-    graphs, labels = filter_features_and_labels(eng.features, eng.labels, model.args)
-    if model.args["target"] in ["scoring", "conceding"]:
-        features_after, _ = filter_features_and_labels(eng.features_receiving, eng.labels, model.args)
-
-    if model.args["target"] in ["intent_scoring", "intent_conceding"]:
-        probs_if_success = []
-        probs_if_failure = []
+    two_case_tasks = ["outcome_scoring", "outcome_conceding", "outcome_return", "intent_return"]
+    if model.args["task"] in two_case_tasks:
+        probs_0 = []
+        probs_1 = []
     else:
         probs = []
 
     with torch.no_grad():
-        graphs = Batch.from_data_list(graphs).to(device)
-        graphs.x = graphs.x[:, : model.args["node_in_dim"]]
+        if model.args["task"] == "shot_blocking":
+            out = torch.sigmoid(model(graphs)).cpu().detach().numpy()  # [B,]
+            event_indices = labels[:, 0].cpu().detach().numpy().astype(int)
+            return pd.Series(out, index=event_indices), None
 
-        if model.args["target"] == "shot_blocking":
-            out = nn.Sigmoid()(model(graphs)).cpu().detach().numpy()  # [B,]
-            action_indices = labels[:, 0].cpu().detach().numpy().astype(int)
-            return pd.Series(out, index=action_indices), None
-
-        elif model.args["target"] in ["scoring", "conceding"]:
-            out_before = nn.Sigmoid()(model(graphs)).cpu().detach().numpy()  # [B,]
-
-            graphs_after = [data for data in features_after if data is not None]
-            graphs_after = Batch.from_data_list(graphs_after).to(device)
-            graphs_after.x = graphs_after.x[:, : model.args["node_in_dim"]]
-
-            model_out_after = nn.Sigmoid()(model(graphs_after)).cpu().detach().numpy()  # [B,]
-            model_out_index = 0
-            out_after = []
-
-            for data in features_after:
-                if data is None:
-                    out_after.append(0)
-                else:
-                    out_after.append(model_out_after[model_out_index])
-                    model_out_index += 1
-
-            probs = np.stack([out_before, np.array(out_after)]).T
-            action_indices = labels[:, 0].cpu().detach().numpy().astype(int)
-            return pd.DataFrame(probs, index=action_indices, columns=["value_before", "value_after"]), None
-
-        elif "intent" in model.args["target"]:  # Select components corresponding to teammates
-            batch = graphs.batch[graphs.x[:, 0] == 1]
-            out = model(graphs)[graphs.x[:, 0] == 1]  # [N',]
-
-        elif "receiver" in model.args["target"]:
+        else:  # model.args["task"].startswith("node")
             batch = graphs.batch
-            if model.args["residual"]:
+            out = model(graphs)
+
+            if TASK_CONFIG.at[model.args["task"], "out_filter"] == "teammates":
+                # Select components corresponding to teammates
+                batch = batch[graphs.x[:, 0] == 1]
+                out = out[graphs.x[:, 0] == 1]  # [N',]
+
+            if "receiver" in model.args["task"] and model.args["include_out"]:
                 batch = torch.cat([batch, torch.unique(graphs.batch)])
-            out = model(graphs)  # [N,] or [N + B,]
 
-    include_goals = model.args["target"] == "oppo_agn_intent"
-    tqdm_desc = "weight" if model.args["target"] == "oppo_agn_intent" else model.args["target"].split("_")[-1]
+    players = set()
 
-    for i in tqdm(range(graphs.num_graphs), desc=tqdm_desc):
-        action_index = int(labels[i, 0].item())
-        active_players = find_active_players(eng, action_index, include_goals=include_goals)
+    for i in tqdm(range(graphs.num_graphs), desc=model.args["task"]):
+        event_index = int(labels[i, 0].item())
 
-        if model.args["target"] in ["intent", "oppo_agn_intent", "receiver"]:  # node_selection
-            probs_i = nn.Softmax(dim=0)(out[batch == i]).cpu().detach().numpy()
-        elif model.args["target"].split("_")[1] in ["scoring", "conceding"]:  # node_binary or graph_binary
-            probs_i = nn.Sigmoid()(out[batch == i]).cpu().detach().numpy()
-
-        if "intent" in model.args["target"]:
-            player_indices = active_players[0]
-        elif "receiver" in model.args["target"]:
-            player_indices = active_players[0] + active_players[1]
-            if model.args["residual"]:
-                player_indices.append("out")
-
-        if model.args["target"] in ["intent_scoring", "intent_conceding"]:
-            probs_i_if_success = dict(zip(player_indices, probs_i[:, 1].tolist()))
-            probs_i_if_failure = dict(zip(player_indices, probs_i[:, 0].tolist()))
-            probs_if_success.append(dict(**probs_i_if_success, **{"index": action_index}))
-            probs_if_failure.append(dict(**probs_i_if_failure, **{"index": action_index}))
+        if post_action:
+            frame = int(match.actions.at[event_index, "end_frame_id"])
+            team = match.actions.at[event_index, "end_player_id"][:4]
         else:
-            probs_i = dict(zip(player_indices, probs_i.tolist()))
-            probs.append(dict(**probs_i, **{"index": action_index}))
+            frame = int(match.actions.at[event_index, "frame_id"])
+            team = match.actions.at[event_index, "object_id"][:4]
 
-    valid_traces = eng.traces.dropna(axis=1, how="all")
-    if include_goals:
-        home_players = [c[:-2] for c in valid_traces.columns if re.match(r"home_.*_x", c)]
-        away_players = [c[:-2] for c in valid_traces.columns if re.match(r"away_.*_x", c)]
-    else:
-        home_players = [c[:-2] for c in valid_traces.columns if re.match(r"home_\d+_x", c)]
-        away_players = [c[:-2] for c in valid_traces.columns if re.match(r"away_\d+_x", c)]
-    players = home_players + away_players
+        active_players = find_active_players(match.tracking, frame, team, include_goals=include_goals)
 
-    if model.args["target"] in ["intent_scoring", "intent_conceding"]:
-        probs_if_success = pd.DataFrame(probs_if_success).set_index("index")[players]
-        probs_if_failure = pd.DataFrame(probs_if_failure).set_index("index")[players]
-        return probs_if_success, probs_if_failure
+        if gnn_task == "node_selection":
+            probs_i = torch.softmax(out[batch == i], dim=0).cpu().detach().numpy()
+        elif gnn_task in ["node_binary", "graph_binary"]:
+            probs_i = torch.sigmoid(out[batch == i]).cpu().detach().numpy()
+        elif gnn_task == "node_regression":
+            probs_i = torch.sigmoid(out[batch == i]).cpu().detach().numpy() * 2 - 1
+
+        if out_filter == "teammates":
+            player_indices_i = active_players[0]
+        elif out_filter == "all":  # "receiver" in model.args["task"]
+            player_indices_i = active_players[0] + active_players[1]
+            if model.args["include_out"]:
+                player_indices_i.append("out")
+
+        players = players | set(player_indices_i)
+
+        if model.args["task"] in two_case_tasks:
+            probs_i0 = dict(zip(player_indices_i, probs_i[:, 0].tolist()))
+            probs_i1 = dict(zip(player_indices_i, probs_i[:, 1].tolist()))
+            probs_0.append(dict(**probs_i0, **{"index": event_index}))
+            probs_1.append(dict(**probs_i1, **{"index": event_index}))
+        else:
+            probs_i = dict(zip(player_indices_i, probs_i.tolist()))
+            probs.append(dict(**probs_i, **{"index": event_index}))
+
+    players = sorted(list(players), key=player_sort_key)
+
+    if model.args["task"] in two_case_tasks:
+        probs_0 = pd.DataFrame(probs_0).set_index("index")[players]
+        probs_1 = pd.DataFrame(probs_1).set_index("index")[players]
+        return probs_0, probs_1
     else:
         return pd.DataFrame(probs).set_index("index")[players], None
 
 
-def inference_success(eng: FeatureEngineer, model: GAT, device="cuda") -> pd.DataFrame:
-    graphs, labels = filter_features_and_labels(eng.features, eng.labels, model.args)
-    success_probs = []
-
-    for data_index in tqdm(range(len(graphs)), desc="success"):
-        graph_i = graphs[data_index].to(device)
-
-        action_index = int(labels[data_index, 0].item())
-        active_players = find_active_players(eng, action_index)
-        n_teammates = len(active_players[0])
-
-        intended_graphs = []
-        for intent_index in range(n_teammates):
-            intent_onehot = torch.zeros(graph_i.x.shape[0]).to(device)
-            intent_onehot[intent_index] = 1
-            intended_nodes = torch.cat([graph_i.x, intent_onehot.unsqueeze(1)], -1)
-            intended_graph = Data(x=intended_nodes, edge_index=graph_i.edge_index, edge_attr=graph_i.edge_attr)
-            intended_graphs.append(intended_graph)
-        intended_graphs = Batch.from_data_list(intended_graphs).to(device)
-
-        if model is not None:
-            with torch.no_grad():
-                out = model(intended_graphs)
-                success_probs_i = nn.Sigmoid()(out).cpu().detach().numpy()  # [11,]
-                success_probs_i = dict(zip(active_players[0], success_probs_i))
-                success_probs.append(dict(**success_probs_i, **{"index": action_index}))
-
-    valid_traces = eng.traces.dropna(axis=1, how="all")
-    home_players = [c[:-2] for c in valid_traces.columns if re.match(r"home_\d+_x", c)]
-    away_players = [c[:-2] for c in valid_traces.columns if re.match(r"away_\d+_x", c)]
-    return pd.DataFrame(success_probs).set_index("index")[home_players + away_players]
-
-
-def inference_posterior(eng: FeatureEngineer, model: GAT = None, device="cuda") -> pd.DataFrame:
-    graphs, labels = filter_features_and_labels(eng.features, eng.labels, model.args)
+def inference_gnn_posterior(
+    match: Match,
+    model: GNN = None,
+    device="cuda",
+    event_indices: pd.Index = None,
+    melt: bool = True,
+) -> pd.DataFrame:
+    graphs, labels = filter_features_and_labels(match.graph_features_0, match.labels, model.args, event_indices)
     include_goals = (graphs[0].x[:, 2] == 1).any().item()
     posteriors = []
 
-    for data_index in tqdm(range(len(graphs)), desc="posterior"):
+    for data_index in tqdm(range(len(graphs)), desc="failure_posterior"):
         graph_i = graphs[data_index].to(device)
 
-        action_index = int(labels[data_index, 0].item())
-        active_players = find_active_players(eng, action_index, include_goals=include_goals)
+        event_index = int(labels[data_index, 0].item())
+        frame = int(match.actions.at[event_index, "frame_id"])
+        team = match.actions.at[event_index, "object_id"][:4]
+        active_players = find_active_players(match.tracking, frame, team, include_goals=include_goals)
         n_teammates = len(active_players[0])
 
         intended_graphs = []
@@ -188,19 +165,81 @@ def inference_posterior(eng: FeatureEngineer, model: GAT = None, device="cuda") 
         intended_graphs = Batch.from_data_list(intended_graphs).to(device)
 
         with torch.no_grad():
-            logits = model(intended_graphs)  # [12 * 22 + 12,]
+            logits = model(intended_graphs)  # [12 * 24 + 12,] if include_out else [12 * 24,]
 
-        receive_logits = logits[:-n_teammates].reshape(n_teammates, -1)  # [12, 22]
-        ballout_logits = logits[-n_teammates:].unsqueeze(1)  # [12, 1]
-        logits = torch.cat([receive_logits, ballout_logits], 1)  # [12, 23]
-        posteriors_i = nn.Softmax(dim=1)(logits[:, n_teammates:]).cpu().detach().numpy()  # [12, 12]
+        if model.args["include_out"]:
+            receive_logits = logits[:-n_teammates].reshape(n_teammates, -1)  # [12, 24]
+            ballout_logits = logits[-n_teammates:].unsqueeze(1)  # [12, 1]
+            logits = torch.cat([receive_logits, ballout_logits], 1)  # [12, 25]
+            posteriors_i = torch.softmax(logits[:, n_teammates:], dim=1).cpu().detach().numpy()  # [12, 13]
+            posteriors_i = pd.DataFrame(posteriors_i, index=active_players[0], columns=active_players[1] + ["out"])
 
-        posteriors_i = pd.DataFrame(posteriors_i, index=active_players[0], columns=active_players[1] + ["out"])
-        posteriors_i["index"] = action_index
+        else:
+            logits = logits.reshape(n_teammates, -1)  # [12, 24]
+            posteriors_i = torch.softmax(logits[:, n_teammates:], dim=1).cpu().detach().numpy()  # [12, 12]
+            posteriors_i = pd.DataFrame(posteriors_i, index=active_players[0], columns=active_players[1])
+
+        posteriors_i["index"] = event_index
         posteriors_i.index.name = "option"
         posteriors.append(posteriors_i)
 
-    valid_traces = eng.traces.dropna(axis=1, how="all")
-    home_players = [c[:-2] for c in valid_traces.columns if re.match(r"home_\d+_x", c)]
-    away_players = [c[:-2] for c in valid_traces.columns if re.match(r"away_\d+_x", c)]
-    return pd.concat(posteriors)[["index"] + home_players + away_players + ["out"]]
+    valid_tracking = match.tracking.dropna(axis=1, how="all")
+    home_players = [c[:-2] for c in valid_tracking.columns if re.match(r"home_\d+_x", c)]
+    away_players = [c[:-2] for c in valid_tracking.columns if re.match(r"away_\d+_x", c)]
+
+    if model.args["include_out"]:
+        posteriors = pd.concat(posteriors)[["index"] + home_players + away_players + ["out"]].reset_index()
+    else:
+        posteriors = pd.concat(posteriors)[["index"] + home_players + away_players].reset_index()
+
+    if melt:
+        posteriors = posteriors.melt(id_vars=["index", "option"], var_name="defender", value_name="posterior")
+        return posteriors.dropna(subset=["posterior"]).reset_index(drop=True).copy()
+    else:
+        return posteriors
+
+
+def inference_gnn_grid(match: Match, model: GNN, device="cuda") -> Dict[int, torch.Tensor]:
+    assert "dest" in model.args["task"]
+
+    grid_size = (int(FIELD_SIZE[0]), int(FIELD_SIZE[1]))
+    grid = np.mgrid[0 : grid_size[0], grid_size[1] - 1 : -1 : -1] + 0.5  # [2, 105, 68]
+    grid = np.transpose(grid, (0, 2, 1)).reshape(2, -1)  # [2, 68 * 105]
+    dest_tensor = torch.tensor(grid.T, dtype=torch.float32).to(device)  # [68 * 105, 2]
+    n_cells = dest_tensor.shape[0]  # G = 68 * 105
+
+    graphs, labels = filter_features_and_labels(match.graph_features_0, match.labels, model.args)
+    receive_probs = dict()
+    success_probs = dict()
+
+    for data_index in tqdm(range(len(graphs)), desc="dest_receiver"):
+        graph_i = graphs[data_index].to(device)
+
+        with torch.no_grad():
+            graph_i = Batch.from_data_list([graph_i]).to(device)
+            node_emb, graph_emb = model.encoder(graph_i)  # [P, z], [1, z]
+
+            node_feat_rep = graph_i.x.repeat(n_cells, 1)  # [G * P, x]
+            node_emb_rep = node_emb.repeat(n_cells, 1)  # [G * P, z]
+            graph_emb_rep = graph_emb.repeat(n_cells, 1)  # [G, z]
+            batch_indices = torch.arange(n_cells, device=device).repeat_interleave(graph_i.num_nodes)
+
+            logits_i = model.decoder(node_feat_rep, node_emb_rep, graph_emb_rep, batch_indices, dest_tensor)
+
+        if model.args["include_out"]:
+            node_logits = logits_i[:-n_cells].view(n_cells, -1)  # [G, P]
+            out_logits = logits_i[-n_cells:].view(n_cells, 1)  # [G, 1]
+            logits_i = torch.cat([node_logits, out_logits], dim=-1)  # [G, P + 1]
+        else:
+            logits_i = logits_i.view(n_cells, -1)  # [G, P]
+
+        event_index = int(labels[data_index, 0].item())
+
+        receive_probs_i = F.softmax(logits_i, dim=-1)  # [G, P(+1)]
+        n_teammates = torch.sum(graph_i.x[:, 0] == 1).item()
+        receive_probs[event_index] = receive_probs_i.reshape(grid_size[1], grid_size[0], -1)
+
+        success_probs_i = receive_probs_i[:, :n_teammates].sum(axis=1)
+        success_probs[event_index] = success_probs_i.reshape(grid_size[1], grid_size[0])
+
+    return receive_probs, success_probs

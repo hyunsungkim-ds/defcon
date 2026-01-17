@@ -4,79 +4,118 @@
 	</h1>
 </div>
 
-Source code for the paper **Better Prevent than Tackle: Valuing Defense in Soccer Based on Graph Neural Networks** by Kim et al., 2025 (under review).
+Source code for the paper [Better Prevent than Tackle: Valuing Defense in Soccer Based on Graph Neural Networks](https://arxiv.org/abs/2512.10355) by Kim et al., 2025 (under review).
 
 ## Introduction
-**DEFCON (DEFensive CONtribution evaluator)** is a framework for evaluating the defensive contribution of soccer players in terms of reducing the expected return of the opposing team in a given situation.
+**DEFCON (DEFensive CONtribution evaluator)** is a framework for evaluating the defensive contribution of soccer players in terms of reducing the Expected Possession Value (EPV) of the opposing team in a given situation.
 
-![main](img/main.png)<br>
+<p align="center">
+  <img src="img/main.png" />
+</p>
 
+## Data Availability and Preparation
+This codebase requires tracking data in the [Kloppy](https://kloppy.pysport.org) format and event data in the [SPADL (Decroos et al., 2019)](https://socceraction.readthedocs.io/en/latest/documentation/spadl/spadl.html) format.
 
-## Data Availability
-Our code requires tracking data in the [kloppy](https://kloppy.pysport.org) format and event data in the [SPADL](https://socceraction.readthedocs.io/en/latest/documentation/spadl/spadl.html) format. However, the dataset used in this project is proprietary and cannot be publicly shared as it is an internal asset of the data provider.
+The dataset used in this project cannot be publicly released, as it is an internal asset of AFC Ajax. However, users can apply DEFCON to their own datasets by following the same data format.
 
-If you have your own event and tracking datasets, you can use them for training and testing component models described below. In the current implementation, the data should be placed in the following paths:
-- Tracking data: per-match Parquet files in `data/ajax/tracking` directory
-- Event data: A single parquet file at `data/ajax/event/event.parquet`
+The current implementation assumes the following directory structure:
+- Tracking data: per-match Parquet files in `data/ajax/tracking/`
+- Event data: Per-match Parquet files at `data/ajax/event_synced/`
 - Match lineups: A single parquet file at `data/ajax/lineup/line_up.parquet`
 
-You can get a better understanding of the data usage by referring to the execution part at the bottom of `datatools/feature.py`.
+### 1. Tracking Data Preprocessing
+Running the following command performs preprocessing on the raw Kloppy-format tracking data.
+```
+python datatools/preprocess.py
+```
+This step includes basic cleaning as well as the computation of kinematic features such as player velocity and acceleration. The processed tracking data are saved to `data/ajax/tracking_processed/` and are used for subsequent feature extraction.
+
+### 2. Event-Tracking Data Synchronization
+For event data, we recommend synchronizing event timestamps with tracking data using [ELASTIC (Kim et al., 2025)](https://arxiv.org/abs/2508.09238) before use. This ensures frame-level alignment between event annotations and tracking data, which is crucial for accurately estimating component values. The synchronized event data should be stored in `data/ajax/event_synced/`.
+
+### 3. Shot Event Data for Unblocked-Shot Expected Goals (UxG)
+Unlike other component models, UxG is not trained using tracking data. Instead, it is trained on shot events from the [Wyscout Open Event Dataset (Pappalardo et al., 2019)](https://www.nature.com/articles/s41597-019-0247-7), which provides a substantially larger number of shot samples. For reproducibility, we provide the preprocessed shot features and labels used to train the UxG model as a CSV file: `data/event_xg_train.csv`. See **Section 3.2** of the paper for further details.
 
 ## Detailed Instructions
-The framework requires the estimation of six key components for a given moment of action as follows:
-- [Section 3.2] **Expected return** indicating the difference between the goal-scoring and goal-conceding probabilities of the attacking team within the next 10 events.
-- [Section 3.3.1] **Receiver selection probability** that each teammate of the passer becomes the target (i.e., the "intended" receiver) of a pass. This probability is not a main component of the defensive credit, but used in oversampling less-likely instances when training the following *pass success model*.
-- [Section 3.3.1] **Pass success probability** that the pass to each teammate is successful.
-- [Section 3.3.2] **Shot-blocking probability** that the shot made in the given situation would be blocked by a defender.
-- [Section 3.4] **Success-conditioned expected return** indicating the expected return of the attacking team under the condition that the pass to each teammate was successful.
-- [Section 3.5] **Failure-conditioned posterior probability** that each of the opposing defenders would have caused the failure if a pass or a shot failed.
+The framework estimates seven key components at each moment of action as follows:
+- **(a1) Action selection probability** that the ball possessor selects each teammate as the "intended" receiver or takes a shot.
+- **(b1) Pass success probability** that a pass to each teammate is successful.
+- **(b2) Shot-blocking probability** that a shot made in the given situation is blocked by a defender.
+- **(c1) Outcome-conditioned goal-scoring probability** that the attacking team shortly scores a goal if a pass to each teammate or a shot was successful/failed.
+- **(c2) Outcome-conditioned goal-conceding probability** that the attacking team shortly concedes a goal if the pass to each teammate or a shot is successful/failed.
+- **(c3) Unblocked-shot expected goal (UxG)** representing the goal-scoring probability of a shot if it is not blocked.
+- **(d1) Defender responsibility** indicating how responsible each defender is for defending each pass or shot.
 
-### 1. Generating Features and Labels
-Once you have formatted data and installed the packages listed in `requirements.txt`, you can generate features and labels for training and testing the component models by executing `datatools/feature.py` with `action_type` as an argument:
+The modeling details of these components are described in **Section 3** of the paper.
+
+### 1. Extracting Graph Features and Labels (Section 3.1)
+After formatting the data and installing the dependencies listed in `requirements.txt`, features and labels for the component models can be generated by running:
 ```
-python datatools/feature.py --action_type {placeholder}
+python datatools/graph_feature.py --action_type {all|shot} --split {train|test} (--post_action) (--augment blocks)
 ```
-The placeholder should be either `all`, `pass`, `shot`, or `failure`, and varies according to the type of component. The corresponding `action_type` for each component is listed in Table 1 of the paper. Namely, the specific comments for generating features and labels for each component are as follows:
-- [Section 3.2] Expected return: `python datatools/feature.py --action_type all`
-- [Sections 3.3.1 and 3.4] Pass success probability, receiver selection probability, and success-conditioned expected return: `python datatools/feature.py --action_type pass`
-- [Section 3.3.2] Shot-blocking probability: `python datatools/feature.py --action_type shot`
-- [Section 3.5] Failure-conditioned posterior probability: `python datatools/feature.py --action_type failure`
+The specific commands for generating training features and labels are:
+- Shot-blocking probability: `python datatools/graph_feature.py --action_type shot --split train`
+- Defender responsbility: `python datatools/graph_feature.py --action_type all --split train --augment_blocks`
+- Other components: `python datatools/graph_feature.py --action_type all --split train`
 
-### 2. Training Component Models
-With proper features and labels, you can train individual GNN models by executing the following scripts:
-- [Section 3.2] Expected return: `sh scripts/scoring.sh`
-- [Section 3.3.1] Pass success probability: `sh scripts/intent_success.sh`
-- [Section 3.3.1] Receiver selection probability: `sh scripts/intent.sh`
-- [Section 3.3.2] Shot-blocking probability: `sh scripts/shot_blocking.sh`
-- [Section 3.4] Success-conditioned expected returns: `sh scripts/intent_scoring.sh`
-- [Section 3.5] Failure-conditioned posterior probability: `sh scripts/failure_receiver.sh`
+The resulting features and labels are saved to `data/ajax/features/`.
 
-Since our GNN models are based on [PyG](https://www.pyg.org), please make sure to install PyG whose version is compatible with your CUDA environment and PyTorch.
+For test data generation, replace `--split train` with `--split test --post_action` in the above commands. The `--post_action` flag is required to extract features **after** each action in the test data, which are later used for computing defensive scores.
 
-### 3. Evaluating Component Models
-By running `test.py` with `model_id` that you want to evaluate as an argument, you can evaluate the model's predictive performance on test data. For example, if you want to evaluate the pass success model whose trial ID is 01, you can execute the following command:
+### 2. Training GNN-Based Component Models (Section 3.1)
+All components except UxG (c3) are modeled based on Graph Neural Networks (GNNs), as described in Section 3.1 of the paper. They can be trained independently using the following scripts:
+- (a1) Action selection probability: `sh scripts/action_intent.sh`
+- (b1) Pass success probability: `sh scripts/pass_success.sh`
+- (b2) Shot-blocking probability: `sh scripts/shot_blocking.sh`
+- (c1) Outcome-conditioned goal-scoring probability: `sh scripts/outcome_scoring.sh`
+- (c2) Outcome-conditioned goal-conceding probability: `sh scripts/outcome_conceding.sh`
+- (d1) Defender responsibility: `sh scripts/failure_receiver.sh`
+
+The GNN models are implemented using [PyTorch Geometric (PyG)](https://www.pyg.org). Please ensure that the installed PyG version is compatible with your PyTorch and CUDA environment.
+
+### 3. Training the UxG Model (Section 3.2)
+To leverage the [publicly available event dataset](https://www.nature.com/articles/s41597-019-0247-7) that provides a sufficiently large number of shots, we separately model UxG (c3) using a logistic regression based solely on shot location-related features. Training the UxG model does not require a separate script. Instead, when running `main.py`, the code automatically loads the preprocessed shot features and labels from `data/event_xg_train.csv` and fits the model before computing player-level defensive scores.
+
+### 4. Evaluating GNN-Based Component Models (Section 4)
+Model performance on the test set can be evaluated using `test.py`. For example, the command for evaluating the action selection model with trial ID 01 is:
 ```
-python test.py --model_id intent_success/01
+python test.py --model_id action_intent/01
 ```
 
-### 4. Calculating Defensive Scores per Player
-Once you have trained all of the component models, you can calculate the per-match player scores by running `main.py`:
+### 5. Calculating Player Defensive Scores (Section 2)
+After training all component models, player defensive scores per match can be computed by running:
 ```
 python main.py --result_path data/player_scores.parquet
 ```
-The resulting Parquet file will be saved at the designated path.
+The resulting scores will be saved as a Parquet file at the specified path.
 
-### 5. Match Analysis with Visualization
-By running cells in `tutorial.ipynb`, you can visualize a specific moment of the match with estimated component values for post-match analysis. As a result, the following example figure on the left side displays the **team credits** corresponding to passing options (including passes to red #4 and $5) in a given situation, where the color of each attacking player indicates the **success probability** of the pass targeted to the player. Meanwhile, the figure on the right side shows the **player credits** assigned to individual defenders for preventing a pass to red #5 from happening. Here, the color of each defender signifies the **interception probability** (i.e., the **failure posterior**) of him if the pass to red #5 failed.
-<p align="center">
-  <img src="img/team_credits.png" width="48%" />
-  <img src="img/player_credits.png" width="48%" />
-</p>
-
-Also, you can plot the players' defensive scores of the match as the following example:
-
+### 6. Match Analysis with Visualization
+The notebook `tutorial.ipynb` provides an end-to-end workflow for match-level analysis using DEFCON. Through this tutorial, you can:
+- Generate features and labels for a single match
+- Estimate component values using trained models
+- Compute player-level defensive scores, corresponding to Figure 6 of the paper
 <p align="center">
   <img src="img/score_plot.png" width="80%" />
 </p>
 
+In addition, the notebook allows you to reproduce visualizations presented in the paper, including component value estimates (Figure 2) and defensive credits (Figure 3) for inspecting individual moments.
+<p align="center">
+  <img src="img/sample_probs.png" width=49.4% />
+  <img src="img/sample_credits.png" width=48% />
+</p>
 
+## Citation
+If you use this code or any part of it in your research, please consider citing the following paper:
+```
+@article{Kim2025,
+  author  = {Hyunsung Kim and
+             Sangwoo Seo and
+             Hoyoung Choi and
+             Tom Boomstra and
+             Jinsung Yoon and
+             Chanyoung Park},
+  title   = {Better Prevent than Tackle: Valuing Defense in Soccer Based on Graph Neural Networks},
+  journal = {arXiv preprint arXiv:2512.10355},
+  year    = {2025}
+}
+```

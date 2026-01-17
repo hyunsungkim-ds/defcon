@@ -1,6 +1,7 @@
 import os
 import sys
 from collections import defaultdict
+from typing import Tuple
 
 if not os.getcwd() in sys.path:
     sys.path.append(os.getcwd())
@@ -8,268 +9,549 @@ if not os.getcwd() in sys.path:
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.cluster import DBSCAN
-from torch_geometric.data import Batch, Data
+from torch_geometric.data import Data
 from tqdm import tqdm
 
 from datatools import config
-from datatools.feature import FeatureEngineer
-from datatools.trace_snapshot import TraceSnapshot
-from datatools.utils import sparsify_edges
-from inference import (
-    find_active_players,
-    inference,
-    inference_posterior,
-    inference_success,
-)
+from datatools.event_xg import EventXGModel
+from datatools.match import Match
+from datatools.utils import abbr_position, find_active_players, sparsify_edges
+from datatools.viz_snapshot import SnapshotVisualizer
+from inference import inference_boost, inference_gnn, inference_gnn_posterior
 from models.utils import load_model
 
 
 class DEFCON:
     def __init__(
         self,
-        eng: FeatureEngineer,
-        scoring_model_id="scoring/01",
-        pass_intent_model_id="intent/01",
-        pass_success_model_id="intent_success/01",
-        pass_scoring_model_id="intent_scoring/01",
-        shot_blocking_model_id="shot_blocking/01",
-        posterior_model_id="failure_receiver/01",
-        likelihood_model_id="oppo_agn_intent/01",
+        match: Match,
+        shot_success: str = "unblocked",  # choices: [goal, on_target, unblocked]
+        event_xg_model: EventXGModel = None,
+        select_model_id: str = None,
+        pass_success_model_id: str = None,
+        shot_block_model_id: str = None,
+        shot_xg_model_id: str = None,
+        score_model_id: str = None,
+        concede_model_id: str = None,
+        posterior_model_id: str = None,
         device="cuda",
     ):
-        self.eng = eng
+        self.match = match
+        self.actions = self.match.actions[self.match.actions["end_frame_id"].notna()].copy()
+        self.shot_success = shot_success
         self.device = device
 
-        self.scoring_model = load_model(scoring_model_id, device)
-        self.pass_intent_model = load_model(pass_intent_model_id, device)
+        self.event_xg_model = event_xg_model
+        self.select_model = load_model(select_model_id, device)
         self.pass_success_model = load_model(pass_success_model_id, device)
-        self.pass_scoring_model = load_model(pass_scoring_model_id, device)
-        self.shot_blocking_model = load_model(shot_blocking_model_id, device)
+        self.shot_block_model = load_model(shot_block_model_id, device)
+        self.shot_xg_model = load_model(shot_xg_model_id, device)
+        self.score_model = load_model(score_model_id, device)
+        self.concede_model = load_model(concede_model_id, device)
         self.posterior_model = load_model(posterior_model_id, device)
-        self.likelihood_model = load_model(likelihood_model_id, device)
 
-        self.shot_eng = None  # To generate features for shot_blocking_model
+        self.select_probs_0: pd.DataFrame = None
+        self.success_probs_0: pd.DataFrame = None
+        self.s_score_probs_0: pd.DataFrame = None
+        self.f_score_probs_0: pd.DataFrame = None
+        self.s_concede_probs_0: pd.DataFrame = None
+        self.f_concede_probs_0: pd.DataFrame = None
 
-        self.xreturns = None
-        self.intent_probs = None
-        self.success_probs = None
-        self.goal_if_success = None
-        self.goal_if_failure = None
-        self.posteriors = None
-        self.receive_probs = None
-        self.likelihoods = None
+        self.select_probs_1: pd.DataFrame = None
+        self.success_probs_1: pd.DataFrame = None
+        self.s_score_probs_1: pd.DataFrame = None
+        self.f_score_probs_1: pd.DataFrame = None
+        self.s_concede_probs_1: pd.DataFrame = None
+        self.f_concede_probs_1: pd.DataFrame = None
 
-        self.advantages = None
-        self.team_credits = None
-        self.player_credits = None
+        self.posteriors: pd.DataFrame = None
+        self.shot_out_prob: float = 2380 / 6950  # Average probability of a shot going out of play
 
+        self.option_values_0: pd.DataFrame = None
+        self.option_values_1: pd.DataFrame = None
+        self.epv: pd.DataFrame = None
+
+        self.credits = None
         self.player_scores = None
 
-    def estimate_components(self):
-        self.xreturns = inference(self.eng, self.scoring_model, self.device)[0]
+    def estimate_components(self, use_vendor_xg: bool = False):
+        indices = self.actions.index
 
-        actions = self.eng.actions.copy()
-        shot_features = self.eng.xg_model.calc_shot_features(actions)
-        xg_unblocked = self.eng.xg_model.pred(shot_features)  # xG if the shot were unblocked
+        self.select_probs_0, _ = inference_gnn(self.match, self.select_model, self.device, False, indices)
+        self.select_probs_1, _ = inference_gnn(self.match, self.select_model, self.device, True, indices)
+        self.success_probs_0, _ = inference_gnn(self.match, self.pass_success_model, self.device, False, indices)
+        self.success_probs_1, _ = inference_gnn(self.match, self.pass_success_model, self.device, True, indices)
 
-        freekicks = actions[actions["spadl_type"].str.startswith("freekick")]
-        corners = actions[actions["spadl_type"].str.startswith("corner")]
-        before_corners = actions[actions["next_type"].str.startswith("corner")]
+        score_probs_0 = inference_gnn(self.match, self.score_model, self.device, False, indices)
+        score_probs_1 = inference_gnn(self.match, self.score_model, self.device, True, indices)
+        concede_probs_0 = inference_gnn(self.match, self.concede_model, self.device, False, indices)
+        concede_probs_1 = inference_gnn(self.match, self.concede_model, self.device, True, indices)
 
-        self.xreturns.loc[freekicks.index, "value_before"] = xg_unblocked.loc[freekicks.index].values
-        self.xreturns.loc[corners.index, "value_before"] = 0.01
-        self.xreturns.loc[before_corners.index, "value_after"] = 0.01
+        self.f_score_probs_0, self.s_score_probs_0 = score_probs_0
+        self.f_score_probs_1, self.s_score_probs_1 = score_probs_1
+        self.f_concede_probs_0, self.s_concede_probs_0 = concede_probs_0
+        self.f_concede_probs_1, self.s_concede_probs_1 = concede_probs_1
 
-        event_teams = actions["object_id"].apply(lambda x: x[:4])
-        receive_teams = actions["receiver_id"].fillna(actions["object_id"]).apply(lambda x: x[:4])
-        self.xreturns["value_before"] *= np.where(actions["action_type"] == "tackle", -1, 1)
-        self.xreturns["value_after"] *= np.where(event_teams != receive_teams, -1, 1)
+        self.posteriors = inference_gnn_posterior(self.match, self.posterior_model, self.device, indices)
+        self.estimate_shot_components(use_vendor_xg)
 
-        is_goal_scoring = (actions["action_type"] == "shot") & (actions["outcome"])
-        self.xreturns.loc[is_goal_scoring, "value_after"] = 1.0
+        self.select_probs_0, self.success_probs_0, self.s_score_probs_0 = self.adjust_set_piece_probs(
+            self.select_probs_0,
+            self.success_probs_0,
+            self.s_score_probs_0,
+            post_action=False,
+        )
+        self.select_probs_1, self.success_probs_1, self.s_score_probs_1 = self.adjust_set_piece_probs(
+            self.select_probs_1,
+            self.success_probs_1,
+            self.s_score_probs_1,
+            post_action=True,
+        )
 
-        self.xreturns["diff"] = self.xreturns["value_after"] - self.xreturns["value_before"]
+    def estimate_shot_components(self, use_vendor_xg: bool = False):
+        if self.shot_success == "unblocked" and self.shot_block_model is not None:
+            block_probs_0, xg_unblocked_0 = self.estimate_shot_block_probs(self.actions, False)
+            block_probs_1, xg_unblocked_1 = self.estimate_shot_block_probs(self.actions, True)
 
-        self.intent_probs = inference(self.eng, self.pass_intent_model, self.device)[0]
-        self.success_probs = inference_success(self.eng, self.pass_success_model, self.device)
-        self.goal_if_success, self.goal_if_failure = inference(self.eng, self.pass_scoring_model, self.device)
-        self.posteriors = inference_posterior(self.eng, self.posterior_model, self.device)
+            self.success_probs_0 = DEFCON.combine_pass_shot_success_probs(self.success_probs_0, 1 - block_probs_0)
+            self.success_probs_1 = DEFCON.combine_pass_shot_success_probs(self.success_probs_1, 1 - block_probs_1)
 
-        self.likelihoods = inference(self.eng, self.likelihood_model, self.device)[0]
-        self.likelihoods["home_goal"] = np.where(self.likelihoods["home_goal"].notna(), 1, np.nan)
-        self.likelihoods["away_goal"] = np.where(self.likelihoods["away_goal"].notna(), 1, np.nan)
+            if use_vendor_xg and "expected_goal" in self.actions.columns:
+                # Use vendor-provided xG values for real shots
+                shot_mask = self.actions["expected_goal"].notna()
+                shot_xg_0 = self.actions.loc[shot_mask, "expected_goal"].astype(float)
+                xg_unblocked_0.loc[shot_mask] = np.minimum(shot_xg_0 / (1 - block_probs_0[shot_mask]), 1)
 
-        if self.shot_blocking_model is not None:
-            potential_shots = actions[(xg_unblocked > 0.01) & (actions["spadl_type"] != "tackle")].copy()
-            self.shot_eng = FeatureEngineer(
-                potential_shots,
-                self.eng.traces,
-                self.eng.lineup,
-                self.eng.xg_model,
-                action_type="predefined",
+                pre_shot_mask = self.actions["expected_goal"].shift(-1).notna()
+                shot_xg_1 = self.actions["expected_goal"].shift(-1).loc[pre_shot_mask].astype(float)
+                xg_unblocked_1.loc[pre_shot_mask] = np.minimum(shot_xg_1 / (1 - block_probs_1[pre_shot_mask]), 1)
+
+            corners = self.actions[self.actions["spadl_type"].str.startswith("corner")]
+            xg_unblocked_0.loc[corners.index] = 0.0
+            self.s_score_probs_0, self.f_score_probs_0, self.s_concede_probs_0, self.f_concede_probs_0 = (
+                DEFCON.combine_pass_shot_goal_probs(
+                    self.s_score_probs_0,
+                    self.f_score_probs_0,
+                    self.s_concede_probs_0,
+                    self.f_concede_probs_0,
+                    xg_unblocked_0,
+                )
             )
-            self.shot_eng.labels = self.shot_eng.generate_label_tensors()
-            self.shot_eng.features = self.shot_eng.generate_feature_graphs(verbose=False)
-            block_probs: pd.Series = inference(self.shot_eng, self.shot_blocking_model, self.device)[0]
+            self.s_score_probs_1, self.f_score_probs_1, self.s_concede_probs_1, self.f_concede_probs_1 = (
+                DEFCON.combine_pass_shot_goal_probs(
+                    self.s_score_probs_1,
+                    self.f_score_probs_1,
+                    self.s_concede_probs_1,
+                    self.f_concede_probs_1,
+                    xg_unblocked_1,
+                )
+            )
 
-            self.success_probs["home_goal"] = np.nan
-            self.success_probs["away_goal"] = np.nan
-            self.goal_if_success["home_goal"] = np.nan
-            self.goal_if_success["away_goal"] = np.nan
-            self.goal_if_failure["home_goal"] = np.nan
-            self.goal_if_failure["away_goal"] = np.nan
+        if self.shot_success in ["goal", "on_target"] and self.shot_xg_model is not None:
+            xg_0 = inference_boost(self.match, self.shot_xg_model, False, event_indices=self.actions.index)
+            xg_1 = inference_boost(self.match, self.shot_xg_model, True, event_indices=self.actions.index)
 
-            for i in self.success_probs.index:
-                if actions.at[i, "object_id"][:4] == "home":
-                    target_goal = "away_goal" if actions.at[i, "action_type"] == "tackle" else "home_goal"
-                else:
-                    target_goal = "home_goal" if actions.at[i, "action_type"] == "tackle" else "away_goal"
+            if use_vendor_xg and "expected_goal" in self.actions.columns:
+                # Use vendor-provided xG values for real shots
+                shot_mask = self.actions["expected_goal"].notna()
+                xg_0.loc[shot_mask] = self.actions.loc[shot_mask, "expected_goal"].astype(float)
 
-                self.success_probs.at[i, target_goal] = 1 - block_probs.at[i] if i in block_probs.index else 0.0
-                self.goal_if_success.at[i, target_goal] = xg_unblocked.at[i] if i not in corners.index else 0.0
-                self.goal_if_failure.at[i, target_goal] = 0.0
+                pre_shot_mask = self.actions["expected_goal"].shift(-1).notna() & (self.actions["end_type"] == "shot")
+                xg_1.loc[pre_shot_mask] = self.actions["expected_goal"].shift(-1).loc[pre_shot_mask].astype(float)
 
-    def find_unique_options(self, action_index: int, intent: str = None, max_dist=50, eps=0.4) -> pd.DataFrame:
-        options = self.success_probs.loc[action_index].drop(["home_goal", "away_goal"]).dropna().index
-        if intent is None:
-            intent = self.eng.actions.at[action_index, "intent_id"]
+            self.success_probs_0 = DEFCON.combine_pass_shot_success_probs(self.success_probs_0, xg_0)
+            self.success_probs_1 = DEFCON.combine_pass_shot_success_probs(self.success_probs_1, xg_1)
 
-        # Take distance and angle to the possessor as input features for DBSCAN
-        data_index = torch.nonzero(self.eng.labels[:, 0] == action_index).item()
-        graph = self.eng.features[data_index]
-        polar_features = graph.x[(graph.x[:, 0] == 1) & (graph.x[:, 2] == 0), -5:-2].numpy().round(4)
-        polar_features[:, 0] = polar_features[:, 0] / max_dist * 2
+            self.s_score_probs_0, self.f_score_probs_0, self.s_concede_probs_0, self.f_concede_probs_0 = (
+                DEFCON.combine_pass_shot_goal_probs(
+                    self.s_score_probs_0,
+                    self.f_score_probs_0,
+                    self.s_concede_probs_0,
+                    self.f_concede_probs_0,
+                )
+            )
+            self.s_score_probs_1, self.f_score_probs_1, self.s_concede_probs_1, self.f_concede_probs_1 = (
+                DEFCON.combine_pass_shot_goal_probs(
+                    self.s_score_probs_1,
+                    self.f_score_probs_1,
+                    self.s_concede_probs_1,
+                    self.f_concede_probs_1,
+                )
+            )
 
-        # Cluster options and choose only one option per cluster
-        dbscan = DBSCAN(eps=eps, min_samples=1)
-        clusters = pd.DataFrame(dbscan.fit_predict(polar_features), index=options, columns=["cluster"])
+            if self.shot_success == "on_target":  # Define shot success as being on target instead of scoring a goal
+                self.success_probs_0, self.s_score_probs_0 = self.replace_xg_with_xgot(
+                    self.success_probs_0, self.s_score_probs_0
+                )
+                self.success_probs_1, self.s_score_probs_1 = self.replace_xg_with_xgot(
+                    self.success_probs_1, self.s_score_probs_1
+                )
 
-        event_credits = self.team_credits.loc[action_index].dropna()
-        unique_options = event_credits[options].groupby(clusters["cluster"]).idxmax()
-        if not intent.endswith("_goal"):
-            unique_options.at[clusters.at[intent, "cluster"]] = intent
+    def estimate_shot_block_probs(self, actions: pd.DataFrame, post_event: bool = False) -> Tuple[pd.Series, pd.Series]:
+        assert self.shot_block_model is not None and self.event_xg_model is not None
 
-        clusters["mask"] = clusters.index.isin(unique_options.values).astype(int)
-        return clusters
+        if post_event:
+            actions = actions.loc[actions["end_frame_id"].notna(), ["end_frame_id", "end_player_id", "end_type"]].copy()
+            actions.columns = ["frame_id", "object_id", "spadl_type"]
+            actions["start_x"] = actions.apply(lambda x: self.match.tracking.at[x["frame_id"], "ball_x"], axis=1)
+            actions["start_y"] = actions.apply(lambda x: self.match.tracking.at[x["frame_id"], "ball_y"], axis=1)
+            actions["start_z"] = actions.apply(lambda x: self.match.tracking.at[x["frame_id"], "ball_z"], axis=1)
 
-    def compute_team_credits(self, mask_likelihood=0.03):
-        actions = self.eng.actions
-        actions["intent_id"] = np.where(actions["intent_id"].notna(), actions["intent_id"], actions["object_id"])
+        shot_features = self.event_xg_model.calc_shot_features(actions)
+        xg_unblocked = self.event_xg_model.pred(shot_features)  # xG if the shot were unblocked
 
-        indices = self.intent_probs.index
-        state_values = self.xreturns.loc[indices, ["value_before"]].values
-        self.advantages = self.goal_if_success - state_values
+        chance_indices = actions[xg_unblocked > 0.01].index
+        block_probs = inference_gnn(self.match, self.shot_block_model, self.device, post_event, chance_indices)[0]
 
-        adv_prevented = self.advantages.copy()
-        adv_intended = [self.advantages.at[i, actions.at[i, "intent_id"]] for i in indices]
-        adv_intended = pd.Series(adv_intended, index=indices)
+        return block_probs, xg_unblocked
 
-        for i in adv_prevented.index:
-            adv_i = adv_prevented.loc[i]
-            if actions.at[i, "action_type"] == "tackle" or self.eng.events.at[i, "goal"]:
-                adv_prevented.loc[i] = adv_i.mask(adv_i.notna(), 0)
+    def replace_xg_with_xgot(
+        self,
+        success_probs: pd.DataFrame,
+        score_probs: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        success_probs = success_probs.copy()
+        score_probs = score_probs.copy()
+
+        targets = ["home_goal", "away_goal"]
+        keepers = np.unique(self.match.phases["active_keepers"].sum())
+        shot_mask = self.posteriors["option"].isin(targets) & self.posteriors["defender"].isin(keepers)
+        shot_resp = self.posteriors[shot_mask].copy()
+
+        for i in success_probs.index:
+            target = f"{self.actions.at[i, 'object_id'][:4]}_goal"
+            xg = success_probs.at[i, target]
+
+            frame = self.actions.at[i, "frame_id"]
+            phase = self.match.tracking.at[frame, "phase_id"]
+            keeper = [p for p in self.match.phases.at[phase, "active_keepers"] if p[:4] != target[:4]][0]
+
+            mask_i = (shot_resp["index"] == i) & (shot_resp["option"] == target) & (shot_resp["defender"] == keeper)
+            keeper_resp = shot_resp[mask_i]["posterior"].iloc[0]
+
+            sot_prob = xg + (1 - xg) * (1 - self.shot_out_prob) * keeper_resp  # Probability of the shot on target
+            xgot = xg / sot_prob  # xG on target
+
+            success_probs.at[i, target] = sot_prob
+            score_probs.at[i, target] = xgot
+
+        return success_probs, score_probs
+
+    @staticmethod
+    def combine_pass_shot_success_probs(
+        pass_success_probs: pd.DataFrame,
+        shot_success_probs: pd.Series,
+    ) -> pd.DataFrame:
+        success_probs = pass_success_probs.copy()
+        success_probs["home_goal"] = np.nan
+        success_probs["away_goal"] = np.nan
+
+        for i in success_probs.index:
+            team = success_probs.loc[i].dropna().index[0][:4]
+            if i in shot_success_probs.index:
+                success_probs.at[i, f"{team}_goal"] = shot_success_probs.at[i]
             else:
-                adv_prevented.loc[i] = adv_i.mask(adv_i <= max(adv_intended.at[i], 0), 0)
+                success_probs.at[i, f"{team}_goal"] = 0.0
 
-        # team_credits = (advantages - adv_intended.values[:, np.newaxis]).clip(0) * self.success_probs
-        self.team_credits: pd.DataFrame = (1 - self.success_probs) * adv_prevented
-        self.team_credits = self.team_credits.astype(float).mask(self.likelihoods < mask_likelihood, 0)
+        return success_probs
 
-        self.team_credits["player_id"] = actions.loc[self.team_credits.index, "object_id"]
-        self.team_credits["receiver_id"] = actions.loc[self.team_credits.index, "receiver_id"]
-        self.team_credits["outcome"] = actions.loc[self.team_credits.index, "outcome"]
-        self.team_credits["intent_id"] = actions.loc[self.team_credits.index, "intent_id"]
+    @staticmethod
+    def combine_pass_shot_goal_probs(
+        s_score_probs: pd.DataFrame,
+        f_score_probs: pd.DataFrame,
+        s_concede_probs: pd.DataFrame,
+        f_concede_probs: pd.DataFrame,
+        xg_unblocked: pd.Series = None,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        s_score_probs = s_score_probs.copy()
+        f_score_probs = f_score_probs.copy()
+        s_concede_probs = s_concede_probs.copy()
+        f_concede_probs = f_concede_probs.copy()
 
-        for i in tqdm(self.team_credits.index, desc="team_credit"):
-            intent = actions.at[i, "intent_id"]
-            option_clusters = self.find_unique_options(i, intent)
-            self.team_credits.loc[i, option_clusters.index] *= option_clusters["mask"].values
+        for goal in ["home_goal", "away_goal"]:
+            s_score_probs[goal] = np.nan
+            f_score_probs[goal] = np.nan
+            s_concede_probs[goal] = np.nan
+            f_concede_probs[goal] = np.nan
 
-            if actions.at[i, "spadl_type"] == "shot" and not actions.at[i, "blocked"]:
-                self.team_credits.at[i, intent] = -self.goal_if_success.at[i, intent]
-                # self.team_credits.at[i, intent] = -max(self.advantages.at[i, intent], 0)
-            elif actions.at[i, "action_type"] == "tackle":
-                self.team_credits.at[i, intent] = self.xreturns.at[i, "diff"]
+        for i in s_score_probs.index:
+            team = s_score_probs.loc[i].dropna().index[0][:4]
+            s_score_probs.at[i, f"{team}_goal"] = 1.0 if xg_unblocked is None else xg_unblocked.at[i]
+            f_score_probs.at[i, f"{team}_goal"] = 0.0
+            s_concede_probs.at[i, f"{team}_goal"] = 0.0
+            f_concede_probs.at[i, f"{team}_goal"] = 0.0
+
+        return s_score_probs, f_score_probs, s_concede_probs, f_concede_probs
+
+    def adjust_set_piece_probs(
+        self,
+        select_probs: pd.DataFrame,
+        success_probs: pd.DataFrame,
+        s_score_probs: pd.DataFrame,
+        post_action: bool = True,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        select_probs = select_probs.copy()
+        success_probs = success_probs.copy()
+        s_score_probs = s_score_probs.copy()
+
+        player_col = "end_player_id" if post_action else "object_id"
+        type_col = "end_type" if post_action else "spadl_type"
+        set_piece_mask = self.actions[type_col].isin(config.SET_PIECE)
+
+        for i in self.actions[set_piece_mask].index:
+            player_id = self.actions.at[i, player_col]
+            shot_target = f"{player_id[:4]}_goal"
+
+            if self.actions.at[i, type_col] == "shot_penalty":
+                select_probs.loc[i] *= 0.0
+                select_probs.at[i, shot_target] = 1.0
+
+                if self.shot_success == "goal":
+                    success_probs.at[i, shot_target] = 0.7884
+                    s_score_probs.at[i, shot_target] = 1.0
+                else:
+                    success_probs.at[i, shot_target] = 1.0
+                    s_score_probs.at[i, shot_target] = 0.7884
+
             else:
-                # elif actions.at[i, "action_type"] != "clearance":
-                self.team_credits.at[i, intent] = -self.xreturns.at[i, "diff"]
+                select_probs.at[i, player_id] = 0.0
+                success_probs.at[i, player_id] = 0.0
 
-    def compute_player_credits(self):
-        # Reshape team_credits to have the same indices with posteriors
-        cols_to_drop = ["player_id", "intent_id", "receiver_id", "outcome"]
-        reshaped_team_credits = []
+                if self.actions.at[i, type_col] == "throw_in":
+                    select_probs.at[i, shot_target] = 0.0
+                    success_probs.at[i, shot_target] = 0.0
 
-        for i in self.team_credits.index:
-            reshaped_i = self.team_credits.loc[i].drop(index=cols_to_drop).dropna().rename("team_credit")
-            reshaped_i = reshaped_i.reset_index().rename(columns={"index": "option"})
+                select_probs.loc[i] /= select_probs.loc[i].astype(float).sum()
 
-            reshaped_i["index"] = i
-            reshaped_i["intended"] = reshaped_i["option"] == self.eng.actions.at[i, "intent_id"]
-            reshaped_i["outcome"] = self.eng.actions.at[i, "outcome"]
+        return select_probs, success_probs, s_score_probs
 
-            reshaped_i.loc[~reshaped_i["intended"] & (reshaped_i["team_credit"] > 0), "defense_type"] = "prevent"
+    def estimate_epv(self) -> pd.DataFrame:
+        s_values_0 = self.s_score_probs_0 - self.s_concede_probs_0
+        f_values_0 = self.f_score_probs_0 - self.f_concede_probs_0
+        self.option_values_0 = self.success_probs_0 * s_values_0 + (1 - self.success_probs_0) * f_values_0
+        epv_0 = (self.select_probs_0 * self.option_values_0).sum(axis=1)
 
-            if self.eng.actions.at[i, "action_type"] == "tackle":
-                reshaped_i.loc[reshaped_i["intended"], "defense_type"] = "tackle"
-                reshaped_i.loc[reshaped_i["intended"], "interceptor"] = self.eng.actions.at[i, "object_id"]
+        s_values_1 = self.s_score_probs_1 - self.s_concede_probs_1
+        f_values_1 = self.f_score_probs_1 - self.f_concede_probs_1
+        self.option_values_1 = self.success_probs_1 * s_values_1 + (1 - self.success_probs_1) * f_values_1
+        epv_1 = (self.select_probs_1 * self.option_values_1).sum(axis=1)
 
-            elif self.eng.actions.at[i, "action_type"] == "shot":
-                next_type = self.eng.actions.at[i, "next_type"]
-                if next_type in config.SET_PIECE_OOP or self.eng.actions.at[i, "outcome"]:
-                    reshaped_i.loc[reshaped_i["intended"], "defense_type"] = "concede"
-                else:
-                    reshaped_i.loc[reshaped_i["intended"], "interceptor"] = self.eng.actions.at[i, "next_player_id"]
-                    if next_type in ["shot_block", "keeper_save"]:
-                        reshaped_i.loc[reshaped_i["intended"], "defense_type"] = next_type
-                    else:
-                        reshaped_i.loc[reshaped_i["intended"], "defense_type"] = "interception"
+        corner_mask = self.actions["spadl_type"].str.startswith("corner")
+        pre_corner_mask = self.actions["end_type"].str.startswith("corner")
+        epv_0.loc[corner_mask] = 0.02
+        epv_1.loc[pre_corner_mask] = 0.02
+        epv_1.loc[self.actions["offside"]] = epv_0.loc[self.actions["offside"]]
 
-            elif self.eng.actions.at[i, "action_type"] == "pass" and self.eng.actions.at[i, "outcome"]:
-                reshaped_i.loc[reshaped_i["intended"], "defense_type"] = "concede"
+        start_teams = self.actions["object_id"].str[:4]
+        end_teams = self.actions["end_player_id"].str[:4]
+        epv_1 *= np.where(start_teams == end_teams, 1, -1)
 
-            elif self.eng.actions.at[i, "next_type"] in config.SET_PIECE_OOP:
-                reshaped_i.loc[reshaped_i["intended"], "defense_type"] = "induce_out"
+        epv_1.loc[(self.actions["action_type"] == "shot") & (self.actions["success"])] = 1.0
+        epv_1.loc[self.actions["spadl_type"] == "own_goal"] = -1.0
 
-            elif self.eng.actions.at[i, "next_type"] not in config.SET_PIECE_OOP:
-                reshaped_i.loc[reshaped_i["intended"], "defense_type"] = "interception"
-                if self.eng.actions.at[i, "next_type"] in config.DEFENSIVE_TOUCH:
-                    reshaped_i.loc[reshaped_i["intended"], "interceptor"] = self.eng.actions.at[i, "next_player_id"]
-                else:
-                    reshaped_i.loc[reshaped_i["intended"], "interceptor"] = self.eng.actions.at[i, "receiver_id"]
+        epv = self.actions[["object_id", "action_type", "spadl_type", "receiver_id", "next_type"]].copy()
+        epv["start"] = epv_0.values
+        epv["end"] = epv_1.values
+        epv["diff"] = epv["end"] - epv["start"]
 
-            reshaped_team_credits.append(reshaped_i)
+        dispossess = (epv["receiver_id"].str[:4] != epv["object_id"].str[:4]) & (epv["receiver_id"].str[:4] != "out")
+        offense_bad_touch = (self.actions["next_type"] == "bad_touch") & (end_teams != start_teams)
+        defense_bad_touch = (self.actions["next_type"] == "bad_touch") & (end_teams == start_teams)
 
-        team_credits = pd.concat(reshaped_team_credits, ignore_index=True)
+        epv["defense_type"] = None
+        epv.loc[~self.actions["success"] & dispossess & ~defense_bad_touch, "defense_type"] = "intercept"
+        epv.loc[~self.actions["success"] & dispossess & defense_bad_touch, "defense_type"] = "concede"
+        epv.loc[~self.actions["success"] & ~dispossess, "defense_type"] = "disturb"
+        epv.loc[self.actions["success"] & (epv["diff"] < 0) & ~offense_bad_touch, "defense_type"] = "deter"
+        epv.loc[self.actions["success"] & (epv["diff"] >= 0), "defense_type"] = "concede"
 
-        # Initialize player credits
-        posteriors = self.posteriors.reset_index().copy()
-        players = [c for c in posteriors.columns if c[:4] in ["home", "away"]]
-        self.player_credits = posteriors[players].astype(float) * 0
+        epv.loc[self.actions["action_type"] == "shot", "defense_type"] += "_shot"
+        epv.loc[self.actions["action_type"] != "shot", "defense_type"] += "_pass"
 
-        # Credits for conceding/preventing passes
-        pass_indices = team_credits["interceptor"].isna() & (team_credits["team_credit"] != 0)
-        pass_credits = team_credits.loc[pass_indices, ["team_credit"]].values.astype(float)
-        self.player_credits.loc[pass_indices] = posteriors.loc[pass_indices, players] * pass_credits
+        epv.loc[(self.actions["next_type"] == "foul") & (end_teams == start_teams), "defense_type"] = "foul"
 
-        # Credits for interceptions and tackles
-        intercept_credits = team_credits[team_credits["interceptor"].notna()]
-        for i in intercept_credits.index:
-            interceptor = team_credits.at[i, "interceptor"]
-            self.player_credits.at[i, interceptor] = team_credits.at[i, "team_credit"]
+        return epv
 
-        self.player_credits["index"] = self.posteriors["index"].values
-        self.player_credits["option"] = self.posteriors.index
-        self.player_credits["defense_type"] = team_credits["defense_type"]
-        self.player_credits = self.player_credits[["index", "option", "defense_type"] + players]
+    def assign_pass_credits(self, i: int) -> pd.DataFrame:
+        target = self.actions.at[i, "intent_id"]
+        receiver = self.actions.at[i, "receiver_id"]
+
+        epv = self.epv.at[i, "start"]
+        s_values = self.s_score_probs_0.loc[i] - self.s_concede_probs_0.loc[i]
+        f_values = self.f_score_probs_0.loc[i] - self.f_concede_probs_0.loc[i]
+
+        deter_values = (1 - self.success_probs_0.loc[i]) * (s_values - f_values)
+        deter_values = deter_values.where(s_values >= epv, 0.0)
+        denom = float(deter_values.sum())
+
+        credits_i = self.posteriors[self.posteriors["index"] == i].copy()
+        credits_i["defense_type"] = None
+        credits_i["team_credit"] = -float(self.epv.at[i, "diff"])
+        credits_i["option_resp"] = 0.0
+        credits_i["weight"] = 0.0
+
+        defense_type = self.epv.at[i, "defense_type"]
+        if defense_type == "intercept_pass":
+            credits_i.loc[credits_i["option"] == target, "option_resp"] = 1.0
+
+            blocker_mask = (credits_i["option"] == target) & (credits_i["defender"] == receiver)
+            defenders_mask = (credits_i["option"] == target) & (credits_i["defender"] != receiver)
+            credits_i.loc[blocker_mask, "defense_type"] = "intercept_pass"
+            credits_i.loc[defenders_mask, "defense_type"] = "disturb_pass"
+
+            if pd.isna(target):
+                credits_i.loc[blocker_mask, "weight"] = 1.0
+            else:
+                success_prob_ij = self.success_probs_0.at[i, target]
+                posteriors_ij = credits_i.loc[credits_i["option"] == target, "posterior"].values
+                credits_i.loc[credits_i["option"] == target, "weight"] = (1 - success_prob_ij) * posteriors_ij
+                credits_i.loc[blocker_mask, "weight"] += success_prob_ij
+
+        elif defense_type in ["disturb_pass", "concede_pass"]:
+            target_mask = credits_i["option"] == target
+            credits_i.loc[target_mask, "defense_type"] = defense_type
+            credits_i.loc[target_mask, "option_resp"] = 1.0
+            credits_i.loc[target_mask, "weight"] = credits_i.loc[target_mask, "posterior"].values
+
+        elif defense_type == "deter_pass" and denom > 0:
+            credits_i["defense_type"] = "deter_pass"
+            credits_i["option_resp"] = credits_i["option"].map(deter_values).fillna(0.0).to_numpy() / denom
+            credits_i["weight"] = credits_i["option_resp"] * credits_i["posterior"]
+            credits_i.loc[credits_i["option_resp"] > 0, "defense_type"] = "deter_pass"
+
+        credits_i["player_credit"] = credits_i["team_credit"] * credits_i["weight"]
+        return credits_i[credits_i["defense_type"].notna()].copy()
+
+    def assign_shot_credits(self, i: int) -> pd.DataFrame:
+        target = self.actions.at[i, "intent_id"]
+        receiver = self.actions.at[i, "receiver_id"]
+
+        epv_0 = float(self.epv.at[i, "start"])
+        epv_1 = 1.0 if self.actions.at[i, "success"] else float(self.epv.at[i, "end"])
+
+        shot_success_prob = float(self.success_probs_0.at[i, target])  # sot_prob or (1 - block_prob)
+        xg_on_success = float(self.s_score_probs_0.at[i, target])  # xgot or xg_unblocked
+
+        credits_i = self.posteriors[
+            (self.posteriors["index"] == i)
+            & (self.posteriors["option"] == target)
+            & (self.posteriors["defender"] != "out")
+        ].copy()
+
+        frame = self.actions.at[i, "frame_id"]
+        phase = self.match.tracking.at[frame, "phase_id"]
+        keeper = [p for p in self.match.phases.at[phase, "active_keepers"] if p[:4] != target[:4]][0]
+        keeper_mask = credits_i["defender"] == keeper
+
+        credits_i["team_credit"] = 0.0
+        credits_i["player_credit"] = 0.0
+
+        if self.actions.at[i, "success"]:  # Conceding a goal
+            credits_i["defense_type"] = "concede_shot"
+            credits_i["team_credit"] = epv_0 - 1.0
+            credits_i["player_credit"] = credits_i["team_credit"] * credits_i["posterior"]
+
+        elif self.actions.at[i, "next_type"] == "keeper_save":  # Saved shot
+            credits_i["defense_type"] = "concede_shot"
+            credits_i["team_credit"] = epv_0 - epv_1
+
+            credits_i.loc[keeper_mask, "posterior"] = 0.0
+            credits_i["posterior"] /= credits_i["posterior"].sum()
+            credits_i.loc[~keeper_mask, "player_credit"] = (epv_0 - xg_on_success) * credits_i["posterior"]
+            credits_i.loc[keeper_mask, "player_credit"] = xg_on_success - epv_1
+
+            if self.actions.at[i, "next_type"] == "keeper_save":
+                credits_i.loc[keeper_mask, "defense_type"] = "intercept_shot"
+
+        elif self.actions.at[i, "next_type"] == "shot_block":  # Blocked shot
+            credits_i["defense_type"] = "disturb_shot"
+            credits_i.loc[keeper_mask, "posterior"] = 0.0
+            credits_i["posterior"] /= credits_i["posterior"].sum()
+            credits_i["weight"] = (1 - shot_success_prob) * credits_i["posterior"]
+
+            blocker_mask = credits_i["defender"] == receiver
+            credits_i.loc[blocker_mask, "defense_type"] = "intercept_shot"
+            credits_i.loc[blocker_mask, "weight"] += shot_success_prob
+
+            credits_i["team_credit"] = epv_0 - epv_1
+            credits_i["player_credit"] = credits_i["team_credit"] * credits_i["weight"]
+
+        elif self.actions.at[i, "woodwork"]:  # Shot off the woodwork
+            credits_i["defense_type"] = "concede_shot"
+            credits_i["team_credit"] = min(epv_0 - 0.5, 0)
+            credits_i["player_credit"] = credits_i["team_credit"] * credits_i["posterior"]
+
+        elif receiver[:4] in [target[:4], "out"]:  # Unblocked shot
+            if self.shot_success == "on_target":
+                xg = xg_on_success * shot_success_prob
+                unblocked_xg = xg / min(shot_success_prob + (1 - xg) * self.shot_out_prob, 1)
+            elif self.shot_success == "unblocked":
+                unblocked_xg = xg_on_success
+            else:
+                unblocked_xg = epv_0
+
+            credits_i["defense_type"] = "concede_shot"
+            credits_i["team_credit"] = epv_0 - unblocked_xg
+
+            credits_i.loc[keeper_mask, "posterior"] = 0.0
+            credits_i["posterior"] /= credits_i["posterior"].sum()
+            credits_i.loc[~keeper_mask, "player_credit"] = credits_i["team_credit"] * credits_i["posterior"]
+
+        return credits_i
+
+    def assign_foul_credits(self, i: int) -> pd.DataFrame:
+        player_id = self.actions.at[i, "object_id"]
+        action_type = self.actions.at[i, "action_type"]
+
+        next_events = self.match.events.loc[i + 1 : i + 2].copy()
+        oppo_foul_mask = (next_events["spadl_type"] == "foul") & (next_events["object_id"].str[:4] != player_id[:4])
+        oppo_foul_i = next_events[oppo_foul_mask]
+
+        if len(oppo_foul_i) == 1:
+            oppo_foul_i = oppo_foul_i.iloc[0]
+            credits_i = {
+                "index": i,
+                "option": self.actions.at[i, "intent_id"],
+                "defender": oppo_foul_i["object_id"],
+                "posterior": 1.0,
+                "team_credit": -self.epv.at[i, "diff"],
+                "weight": 1.0,
+                "player_credit": -self.epv.at[i, "diff"],
+            }
+            if oppo_foul_i["success"]:
+                credits_i["defense_type"] = "disturb_shot" if action_type == "shot" else "disturb_pass"
+            else:
+                credits_i["defense_type"] = "foul"
+            return pd.Series(credits_i).to_frame().T
+        elif action_type == "shot":
+            return self.assign_shot_credits(i)
+        else:
+            return self.assign_pass_credits(i)
+
+    def assign_credits(self) -> pd.DataFrame:
+        credits = []
+        anomaly_mask = self.actions["anomaly"].fillna(False)
+
+        for i in tqdm(self.epv.index, "defensive_credit"):
+            if anomaly_mask.at[i] or self.actions.at[i, "spadl_type"] == "own_goal":
+                continue
+            elif self.actions.at[i, "next_type"] == "foul":
+                credits_i = self.assign_foul_credits(i)
+            elif self.actions.at[i, "action_type"] == "shot":
+                credits_i = self.assign_shot_credits(i)
+            else:
+                credits_i = self.assign_pass_credits(i)
+            credits.append(credits_i)
+
+        return pd.concat(credits, ignore_index=True)
 
     def compute_playing_times(self) -> pd.DataFrame:
-        traces = self.eng.traces
+        tracking = self.match.tracking
         seconds = dict()
 
-        for p in self.eng.lineup["object_id"]:
-            inplay_traces = traces[traces[f"{p}_x"].notna() & (traces["ball_state"] == "alive")]
-            player_seconds = inplay_traces.groupby("ball_owning_home_away")["timestamp"].count() / self.eng.fps
+        for p in self.match.lineup["object_id"]:
+            alive_tracking = tracking[tracking[f"{p}_x"].notna() & (tracking["ball_state"] == "alive")]
+            player_seconds = alive_tracking.groupby("ball_owning_home_away")["timestamp"].count() / self.match.fps
             if p[:4] == "home":
                 seconds[p] = [player_seconds["home"], player_seconds["away"]]
             else:
@@ -280,141 +562,200 @@ class DEFCON:
 
         return seconds
 
-    def evaluate(self, mask_likelihood=0.03):
-        if self.success_probs is None:
+    def evaluate_players(self) -> pd.DataFrame:
+        if self.success_probs_0 is None:
             self.estimate_components()
 
-        if self.team_credits is None:
-            self.compute_team_credits(mask_likelihood)
+        self.epv = self.estimate_epv()
+        self.credits = self.assign_credits()
 
-        if self.player_credits is None:
-            self.compute_player_credits()
+        player_scores = self.credits.pivot_table("player_credit", "defender", "defense_type", "sum")
+        player_scores["score"] = player_scores.sum(axis=1)
+        player_scores = player_scores.reset_index().rename(columns={"defender": "player_id"})
 
-        player_scores = self.player_credits.drop(["index", "option"], axis=1).groupby("defense_type").sum().T
-        player_scores["defcon"] = player_scores.sum(axis=1)
+        lineup = self.match.lineup[["object_id", "advanced_position", "match_name", "mins_played"]].copy()
+        lineup.columns = ["player_id", "position", "player_name", "mins_played"]
+        lineup["position"] = lineup["position"].apply(abbr_position)
+        player_scores = pd.merge(lineup, player_scores).set_index("player_id").infer_objects(copy=False).fillna(0)
+
+        playing_times = self.compute_playing_times()
+        player_scores = pd.merge(player_scores.copy(), playing_times, left_index=True, right_index=True)
         player_scores = player_scores.reset_index().rename(columns={"index": "object_id"})
 
-        for t in config.DEFENSE:
-            if t not in player_scores.columns:
-                player_scores[t] = 0.0
+        lineup = self.match.lineup[config.LINEUP_HEADER[:6]].copy()
+        lineup.columns = ["match_id", "match_date", "team_name", "player_id", "object_id", "uniform_number"]
 
-        playing_times = self.compute_playing_times().reset_index()
-        self.player_scores = self.eng.lineup.merge(player_scores).merge(playing_times)
-        self.player_scores["defcon_normal"] = self.player_scores["defcon"] / playing_times["defend_time"] * 2000
-        self.player_scores = self.player_scores[config.DEFCON_HEADER]
+        return pd.merge(lineup, player_scores)
 
-    def visualize(
+    def find_snapshot_values(self, event_index: int, post_event=False) -> pd.DataFrame:
+        spadl_type = self.actions.at[event_index, "spadl_type"]
+        possessor = self.actions.at[event_index, "object_id"]
+        receiver = self.actions.at[event_index, "receiver_id"]
+
+        if self.epv is not None:
+            epv_0 = round(self.epv.at[event_index, "start"], 4)
+            epv_1 = round(self.epv.at[event_index, "end"], 4)
+            print(f"{spadl_type} from {possessor} ({epv_0:.4f}) to {receiver} ({epv_1:.4f})")
+        else:
+            print(f"{spadl_type} from {possessor} to {receiver}")
+
+        if post_event:
+            frame = int(self.actions.at[event_index, "end_frame_id"])
+            team = self.actions.at[event_index, "end_player_id"][:4]
+            players = find_active_players(self.match.tracking, frame, team, include_goals=True)
+            values = pd.DataFrame(index=players[0])
+
+            values["select"] = self.select_probs_1.loc[event_index, players[0]].dropna().astype(float).copy()
+            values["success"] = self.success_probs_1.loc[event_index, players[0]].dropna().astype(float).copy()
+
+            values["s_score"] = self.s_score_probs_1.loc[event_index, players[0]].dropna().astype(float).copy()
+            values["s_concede"] = self.s_concede_probs_1.loc[event_index, players[0]].dropna().astype(float).copy()
+            values["s_value"] = values["s_score"] - values["s_concede"]
+
+            values["f_score"] = self.f_score_probs_1.loc[event_index, players[0]].dropna().astype(float).copy()
+            values["f_concede"] = self.f_concede_probs_1.loc[event_index, players[0]].dropna().astype(float).copy()
+            values["f_value"] = values["f_score"] - values["f_concede"]
+
+            values["option_value"] = values["success"] * values["s_value"] + (1 - values["success"]) * values["f_value"]
+            values["advantage"] = values["s_value"] - values["f_value"]
+
+        else:
+            frame = int(self.match.events.at[event_index, "frame_id"])
+            team = self.match.events.at[event_index, "object_id"][:4]
+            players = find_active_players(self.match.tracking, frame, team, include_goals=True)
+            values = pd.DataFrame(index=players[0])
+
+            values["select"] = self.select_probs_0.loc[event_index, players[0]].dropna().astype(float).copy()
+            values["success"] = self.success_probs_0.loc[event_index, players[0]].dropna().astype(float).copy()
+
+            values["s_score"] = self.s_score_probs_0.loc[event_index, players[0]].dropna().astype(float).copy()
+            values["s_concede"] = self.s_concede_probs_0.loc[event_index, players[0]].dropna().astype(float).copy()
+            values["s_value"] = values["s_score"] - values["s_concede"]
+
+            values["f_score"] = self.f_score_probs_0.loc[event_index, players[0]].dropna().astype(float).copy()
+            values["f_concede"] = self.f_concede_probs_0.loc[event_index, players[0]].dropna().astype(float).copy()
+            values["f_value"] = values["f_score"] - values["f_concede"]
+
+            values["option_value"] = values["success"] * values["s_value"] + (1 - values["success"]) * values["f_value"]
+            values["advantage"] = values["s_value"] - values["f_value"]
+
+        return values
+
+    def visualize_snapshot(
         self,
-        action_index,
-        hypo_intent=None,
+        event_index,
+        post_event=False,
+        hypo_target=None,
         size=None,
         color=None,
         annot=None,
         show_edges=False,
     ) -> pd.DataFrame:
-        frame = self.eng.actions.at[action_index, "frame"]
-        frame_data = self.eng.traces.loc[frame:frame].dropna(axis=1).copy()
+        if post_event:
+            frame = self.actions.at[event_index, "end_frame_id"]
+            spadl_type = self.actions.at[event_index, "end_type"]
+            possessor = self.actions.at[event_index, "end_player_id"]
+            receiver, ball_xy = None, None
 
-        players = find_active_players(self.eng, action_index, include_goals=True)
-        team = players[0][0][:4]
-
-        possessor = self.eng.actions.at[action_index, "object_id"]
-        action_type = self.eng.actions.at[action_index, "action_type"]
-        intent = self.eng.actions.at[action_index, "intent_id"]
-        receiver = self.eng.actions.at[action_index, "receiver_id"]
-
-        self.intent_probs["home_goal"] = 0.0
-        self.intent_probs["away_goal"] = 0.0
-
-        values = pd.DataFrame(index=players[0])
-        values["pass_intent"] = self.intent_probs.loc[action_index, players[0]].dropna().astype(float)
-        values["pass_success"] = self.success_probs.loc[action_index, players[0]].dropna().astype(float)
-        values["goal_if_success"] = self.goal_if_success.loc[action_index, players[0]].dropna().astype(float)
-        values["goal_if_failure"] = self.goal_if_failure.loc[action_index, players[0]].dropna().astype(float)
-        values["oppo_agn_intent"] = self.likelihoods.loc[action_index, players[0]].dropna().astype(float)
-
-        if "advantage" in [size, color, annot] or "team_credit" in [size, color, annot]:
-            values["advantage"] = self.advantages.loc[action_index, players[0]].dropna().astype(float)
-            values["team_credit"] = self.team_credits.loc[action_index, players[0]].dropna().astype(float)
-
-        if hypo_intent is None:
-            next_player = self.eng.actions.at[action_index, "next_player_id"]
-            next_type = self.eng.actions.at[action_index, "next_type"]
-            highlights = dict()
-
-            if intent == intent and not intent.endswith("_goal"):
-                highlights["black"] = [intent]
-
-            if receiver == receiver:
-                if action_type == "shot" and (receiver.endswith("_goal") or next_type in config.SET_PIECE_OOP):
-                    arrows = [(possessor, f"{possessor[:4]}_goal")]
-                elif next_type in config.DEFENSIVE_TOUCH:
-                    highlights["gold"] = [next_player]
-                    arrows = [(possessor, next_player)]
-                elif next_type not in config.SET_PIECE_OOP:
-                    highlights["gold"] = [receiver]
-                    arrows = [(possessor, receiver)]
-                else:
-                    arrows = []
         else:
-            hypo_intent = f"{team}_goal" if hypo_intent == -1 else f"{team}_{hypo_intent}"
-            highlights = dict() if hypo_intent.endswith("_goal") else {"black": [hypo_intent]}
-            arrows = [(intent, hypo_intent)] if action_type == "tackle" else [(possessor, hypo_intent)]
+            frame = self.match.events.at[event_index, "frame_id"]
+            spadl_type = self.match.events.at[event_index, "spadl_type"]
+            possessor = self.match.events.at[event_index, "object_id"]
+            receiver = possessor if spadl_type == "take_on" else self.match.events.at[event_index, "receiver_id"]
+            receive_frame = self.match.events.at[event_index, "receive_frame_id"]
 
-        if "posterior" in [size, color, annot] or "player_credit" in [size, color, annot]:
-            assert hypo_intent is not None
-            opponents = [p for p in players[1] if not p.endswith("_goal")]
+            if not pd.isna(receive_frame):
+                ball_xy = self.match.tracking.loc[frame:receive_frame, ["ball_x", "ball_y"]]
+            else:
+                ball_xy = None
+
+        frame_data = self.match.tracking.loc[frame:frame].dropna(axis=1).copy()
+        players = find_active_players(self.match.tracking, frame, possessor[:4], include_goals=True)
+
+        if event_index in self.actions.index:
+            target = self.actions.at[event_index, "intent_id"] if not post_event else None
+            values = self.find_snapshot_values(event_index, post_event)
+        else:
+            size, color, annot, target, values = None, None, None, None, None
+            print(f"{spadl_type} by {possessor}")
+
+        if hypo_target is None:
+            next_player_id = self.match.events.at[event_index, "next_player_id"]
+            next_type = self.match.events.at[event_index, "next_type"]
+            node_marks = dict()
+
+            # if not pd.isna(target) and not target.endswith("_goal"):
+            #     node_marks["black"] = [target]
+
+            if not pd.isna(receiver):
+                end_x = self.match.events.at[event_index, "end_x"]
+                end_y = self.match.events.at[event_index, "end_y"]
+                arrows = [(possessor, (end_x, end_y))]
+                if next_type in config.DEFENSIVE_TOUCH:
+                    node_marks["gold"] = [next_player_id]
+                elif next_type not in config.SET_PIECE_OOP:
+                    node_marks["gold"] = [receiver]
+            else:
+                arrows = []
+
+        else:
+            hypo_target = f"{possessor[:4]}_goal" if hypo_target == -1 else f"{possessor[:4]}_{hypo_target}"
+            node_marks = dict() if hypo_target.endswith("_goal") else {"black": [hypo_target]}
+            arrows = [(target, hypo_target)] if spadl_type == "tackle" else [(possessor, hypo_target)]
+
+        if "posterior" in [size, color, annot]:
+            target = self.actions.at[event_index, "intent_id"] if hypo_target is None else hypo_target
             if "posterior" in [size, color, annot]:
-                posteriors_i = self.posteriors[self.posteriors["index"] == action_index]
-                posteriors_i = posteriors_i.loc[hypo_intent, opponents].dropna().astype(float)
-            if "player_credit" in [size, color, annot]:
-                player_credits_i = self.player_credits[self.player_credits["index"] == action_index]
-                player_credits_i = player_credits_i.set_index("option").loc[hypo_intent, opponents].astype(float)
+                mask = (
+                    (self.posteriors["index"] == event_index)
+                    & (self.posteriors["option"] == target)
+                    & (self.posteriors["defender"] != "out")
+                )
+                posteriors_i = self.posteriors[mask].set_index("defender")["posterior"].astype(float)
 
-        snapshot_args = {"traces": frame_data, "highlights": highlights, "arrows": arrows}
-        # snapshot_args = {"traces": frame_data}
+        if "player_credit" in [size, color, annot]:
+            assert self.credits is not None
+            mask = (self.credits["index"] == event_index) & (self.credits["defender"] != "out")
+            credits_i = self.credits[mask].set_index("defender")["player_credit"]
+
+        data_args = {"snapshot": frame_data, "ball_xy": ball_xy, "player_marks": node_marks}
+        # data_args = {"snapshot": frame_data, "arrows": arrows}
         for k, col_name in {"player_sizes": size, "player_colors": color, "player_annots": annot}.items():
             if col_name is not None:
                 if col_name == "posterior":
-                    snapshot_args[k] = posteriors_i
+                    data_args[k] = posteriors_i
                 elif col_name == "player_credit":
-                    snapshot_args[k] = player_credits_i
+                    data_args[k] = credits_i
                 else:
-                    snapshot_args[k] = values[col_name]
+                    data_args[k] = values[col_name]
 
         if show_edges:
-            data_index = torch.argwhere(self.eng.labels[:, 0] == action_index).item()
-            graph: Data = self.eng.features[data_index]
+            data_index = torch.argwhere(self.match.labels[:, 0] == event_index).item()
+            graph: Data = self.match.graph_features_0[data_index]
             graph = sparsify_edges(graph, "delaunay")
             edge_index = graph.edge_index.cpu().detach().numpy()
 
             src = [(players[0] + players[1])[i] for i in edge_index[0]]
             dst = [(players[0] + players[1])[i] for i in edge_index[1]]
-            snapshot_args["edges"] = np.array([src, dst]).T
-
-        snapshot = TraceSnapshot(**snapshot_args)
+            data_args["edges"] = np.array([src, dst]).T
 
         style_args = pd.DataFrame(
-            [
-                [400, 2000, 0, 0.5],
-                [500, 2000, 0, 0.5],
-                [0, 1600, 0.3, 1],
-                [400, 2000, 0, 0.5],
-                [500, 20500, -0.01, 0.01],
-                [500, 20500, -0.005, 0.005],
-            ],
-            index=["pass_intent", "oppo_agn_intent", "pass_success", "posterior", "team_credit", "player_credit"],
-            columns=["min_size", "max_size", "min_color", "max_color"],
-        )
+            {
+                "select": [400, 2400, 0, 0.5],
+                "success": [0, 2000, 0.3, 1],
+                "posterior": [400, 2000, 0, 0.5],
+                "team_credit": [500, 20500, -0.01, 0.01],
+                "player_credit": [500, 20500, -0.05, 0.05],
+            },
+            index=["min_size", "max_size", "min_color", "max_color"],
+        ).T
         min_sizes = defaultdict(lambda: 500, style_args["min_size"].to_dict())
         max_sizes = defaultdict(lambda: 20500, style_args["max_size"].to_dict())
-
-        min_colors = {"pass_intent": 0, "oppo_agn_intent": 0, "pass_success": 0.3, "posterior": 0}
-        max_colors = {"pass_intent": 0.5, "oppo_agn_intent": 0.5, "pass_success": 1, "posterior": 0.5}
-        min_colors = defaultdict(lambda: 0.01, style_args["min_color"].to_dict())
+        min_colors = defaultdict(lambda: 0.0, style_args["min_color"].to_dict())
         max_colors = defaultdict(lambda: 0.05, style_args["max_color"].to_dict())
 
-        snapshot.plot(
+        viz = SnapshotVisualizer(**data_args)
+        viz.plot(
             smin=min_sizes[size],
             smax=max_sizes[size],
             cmin=min_colors[color],
@@ -422,4 +763,43 @@ class DEFCON:
             annot_type=annot,
         )
 
-        return values.round(4)
+        return values.round(4) if isinstance(values, pd.DataFrame) else None
+
+    def load_components(self, result_dir="data/ajax/defcon_components"):
+        match_id = self.match.lineup["stats_perform_match_id"].iloc[0]
+
+        self.select_probs_0 = pd.read_parquet(f"{result_dir}/{match_id}/select_probs_0.parquet")
+        self.success_probs_0 = pd.read_parquet(f"{result_dir}/{match_id}/success_probs_0.parquet")
+        self.s_score_probs_0 = pd.read_parquet(f"{result_dir}/{match_id}/s_score_probs_0.parquet")
+        self.f_score_probs_0 = pd.read_parquet(f"{result_dir}/{match_id}/f_score_probs_0.parquet")
+        self.s_concede_probs_0 = pd.read_parquet(f"{result_dir}/{match_id}/s_concede_probs_0.parquet")
+        self.f_concede_probs_0 = pd.read_parquet(f"{result_dir}/{match_id}/f_concede_probs_0.parquet")
+
+        self.select_probs_1 = pd.read_parquet(f"{result_dir}/{match_id}/select_probs_1.parquet")
+        self.success_probs_1 = pd.read_parquet(f"{result_dir}/{match_id}/success_probs_1.parquet")
+        self.s_score_probs_1 = pd.read_parquet(f"{result_dir}/{match_id}/s_score_probs_1.parquet")
+        self.f_score_probs_1 = pd.read_parquet(f"{result_dir}/{match_id}/f_score_probs_1.parquet")
+        self.s_concede_probs_1 = pd.read_parquet(f"{result_dir}/{match_id}/s_concede_probs_1.parquet")
+        self.f_concede_probs_1 = pd.read_parquet(f"{result_dir}/{match_id}/f_concede_probs_1.parquet")
+
+        self.posteriors = pd.read_parquet(f"{result_dir}/{match_id}/posteriors.parquet")
+
+    def save_components(self, result_dir="data/ajax/defcon_components"):
+        match_id = self.match.lineup["stats_perform_match_id"].iloc[0]
+        os.makedirs(f"{result_dir}/{match_id}", exist_ok=True)
+
+        self.select_probs_0.to_parquet(f"{result_dir}/{match_id}/select_probs_0.parquet")
+        self.success_probs_0.to_parquet(f"{result_dir}/{match_id}/success_probs_0.parquet")
+        self.s_score_probs_0.to_parquet(f"{result_dir}/{match_id}/s_score_probs_0.parquet")
+        self.f_score_probs_0.to_parquet(f"{result_dir}/{match_id}/f_score_probs_0.parquet")
+        self.s_concede_probs_0.to_parquet(f"{result_dir}/{match_id}/s_concede_probs_0.parquet")
+        self.f_concede_probs_0.to_parquet(f"{result_dir}/{match_id}/f_concede_probs_0.parquet")
+
+        self.select_probs_1.to_parquet(f"{result_dir}/{match_id}/select_probs_1.parquet")
+        self.success_probs_1.to_parquet(f"{result_dir}/{match_id}/success_probs_1.parquet")
+        self.s_score_probs_1.to_parquet(f"{result_dir}/{match_id}/s_score_probs_1.parquet")
+        self.f_score_probs_1.to_parquet(f"{result_dir}/{match_id}/f_score_probs_1.parquet")
+        self.s_concede_probs_1.to_parquet(f"{result_dir}/{match_id}/s_concede_probs_1.parquet")
+        self.f_concede_probs_1.to_parquet(f"{result_dir}/{match_id}/f_concede_probs_1.parquet")
+
+        self.posteriors.to_parquet(f"{result_dir}/{match_id}/posteriors.parquet")

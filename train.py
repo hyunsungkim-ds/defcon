@@ -14,9 +14,9 @@ from torch_geometric.loader import DataLoader
 
 from dataset import ActionDataset
 from datatools import config
-from models.gat import GAT
+from models.gnn import GNN
 from models.utils import (
-    estimate_likelihoods,
+    estimate_propensity,
     get_args_str,
     get_losses_str,
     num_trainable_params,
@@ -26,34 +26,41 @@ from models.utils import (
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--target", type=str, required=True, help="intent, receiver, success, scoring, conceding")
+parser.add_argument("--task", type=str, required=True)
 parser.add_argument("--trial", type=int, required=True)
 parser.add_argument("--model", type=str, required=True, default="gat")
-
-parser.add_argument("--augment", action="store_true", default=False, help="include augmented data")
-parser.add_argument("--oversampling", type=str, default="none", help="model ID to obtain oversampling probs")
+parser.add_argument("--ipw_model_id", type=str, default="none", help="model ID to estimate propensity scores")
 parser.add_argument("--weight_bce", action="store_true", default=False, help="use weighted BCE to balance classes")
 
-parser.add_argument("--min_duration", type=float, default=0, help="min duration of a valid action")
+parser.add_argument("--augment_blocks", action="store_true", default=False, help="include augmented data")
+parser.add_argument("--min_pass_dur", type=float, default=0, help="min duration of a valid pass")
+parser.add_argument("--shot_success", type=str, required=False, default="unblocked", choices=["goal", "unblocked"])
 parser.add_argument("--xy_only", action="store_true", default=False, help="only use xy locations as features")
 parser.add_argument("--possessor_aware", action="store_true", default=False, help="use possessor features")
 parser.add_argument("--keeper_aware", action="store_true", default=False, help="distinguish keeper & goal nodes")
 parser.add_argument("--ball_z_aware", action="store_true", default=False, help="consider the ball height")
 parser.add_argument("--poss_vel_aware", action="store_true", default=False, help="consider possessor's velocity")
-# parser.add_argument("--one_touch_aware", action="store_true", default=False, help="use one-touch flags as a feature")
+parser.add_argument("--extend_features", action="store_true", default=False, help="handcraft more node features")
 
-parser.add_argument("--use_intent", action="store_true", default=False, help="use intended receivers' locations")
+parser.add_argument("--more_dest_features", action="store_true", default=False, help="handcraft more dest features")
+parser.add_argument("--adjust_dest", action="store_true", default=False, help="adjust destinations of failed actions")
+parser.add_argument("--normalize_dest", action="store_true", default=False, help="normalize action destinations")
+parser.add_argument("--polar_dest", action="store_true", default=False, help="use polar coordinates for destinations")
+parser.add_argument("--dest_sigma", type=float, default=3.0, help="sigma for smoothing target dest distribution")
+
 parser.add_argument("--use_xg", action="store_true", default=False, help="use xG instead of actual goal labels")
-parser.add_argument("--residual", action="store_true", default=False, help="attach a component for ball out of play")
+parser.add_argument("--return_type", type=str, required=False, default="disc_0.9", help="way of defining return")
+parser.add_argument("--include_out", action="store_true", default=False, help="attach a component for ball out of play")
 parser.add_argument("--filter_blockers", action="store_true", default=False, help="only include potential blockers")
 parser.add_argument("--sparsify", type=str, choices=["distance", "delaunay", "none"], help="how to filter edges")
 parser.add_argument("--max_edge_dist", type=int, default=10, help="max distance between off-ball nodes")
 
-parser.add_argument("--edge_in_dim", type=int, required=False, default=0, help="num edge features")
-parser.add_argument("--node_emb_dim", type=int, required=False, default=0, help="node embedding dim")
-parser.add_argument("--graph_emb_dim", type=int, required=False, default=0, help="graph embedding dim")
-parser.add_argument("--gnn_layers", type=int, required=False, default=0, help="num GNN layers")
-parser.add_argument("--gnn_heads", type=int, required=False, default=0, help="num heads of GNN layers")
+parser.add_argument("--node_emb_dim", type=int, required=False, default=128, help="node embedding dim")
+parser.add_argument("--graph_emb_dim", type=int, required=False, default=128, help="graph embedding dim")
+parser.add_argument("--mlp_h1_dim", type=int, required=False, default=32, help="MLP 1st hidden dim")
+parser.add_argument("--mlp_h2_dim", type=int, required=False, default=8, help="MLP 2nd hidden dim")
+parser.add_argument("--gnn_layers", type=int, required=False, default=2, help="num GNN layers")
+parser.add_argument("--gnn_heads", type=int, required=False, default=4, help="num heads of GNN layers")
 parser.add_argument("--dropout", type=float, required=False, default=0, help="dropout prob")
 parser.add_argument("--skip_conn", action="store_true", default=False, help="adopt skip-connection")
 
@@ -74,55 +81,31 @@ args, _ = parser.parse_known_args()
 
 
 if __name__ == "__main__":
-    args.cuda = torch.cuda.is_available()
-    device = "cuda:0" if args.cuda else "cpu"
-
-    # Set manual seed
+    # Set device and manual seed
+    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if args.cuda:
+    if torch.cuda.is_available():
+        device = "cuda"
         torch.cuda.manual_seed(args.seed)
-
-    if args.xy_only:
-        args.node_in_dim = 9 if args.possessor_aware else 8
+        torch.cuda.manual_seed_all(args.seed)
     else:
-        args.node_in_dim = 19 if args.possessor_aware else 13
+        device = "cpu"
 
-    intent_given = args.target in ["intent_success", "failed_pass_receiver", "failure_receiver"]
-    if intent_given:
-        args.node_in_dim += 1
-
-    if args.target in config.NODE_SELECTION:
-        args.task = "node_selection"
-    elif args.target in config.NODE_BINARY:
-        args.task = "node_binary"
-    elif args.target in config.GRAPH_BINARY:
-        args.task = "graph_binary"
-    # elif args.target.startswith("intent_") and args.target.split("_")[1] in ["success", "scoring", "conceding"]:
-    #     args.task = "graph_binary"
-
-    if args.target in ["scoring", "conceding"]:
-        args.action_type = "all"
-    elif args.target.startswith("failure"):
-        args.action_type = "failure"
-    elif args.target == "oppo_agn_intent":
-        args.action_type = "pass_shot"
-    elif args.target.startswith("blocked_shot"):
-        args.action_type = "blocked_shot"
-    elif args.target.startswith("failed_pass"):
-        args.action_type = "failed_pass"
-    elif args.target.startswith("shot"):
-        args.action_type = "shot"
-    else:
-        args.action_type = "pass"
+    args.gnn_task = config.TASK_CONFIG.at[args.task, "gnn_task"]
+    args.condition = config.TASK_CONFIG.at[args.task, "condition"]
+    args.node_in_dim = 26 if args.task == "failure_receiver" else 25
+    args.edge_in_dim = 2
+    args.out_dim = config.TASK_CONFIG.at[args.task, "out_dim"]
 
     # Load model
     args_dict = vars(args)
-    model = GAT(args_dict).to(device)
+    model = GNN(args_dict).to(device)
     model = nn.DataParallel(model)
     args_dict["total_params"] = num_trainable_params(model)
 
     # Create a path to save model arguments and parameters
-    trial_path = f"saved/{args.target}/{args.trial:02d}"
+    trial_path = f"saved/{args.task}/{args.trial:02d}"
+    os.makedirs(f"saved/{args.task}", exist_ok=True)
     os.makedirs(trial_path, exist_ok=True)
     with open(f"{trial_path}/args.json", "w") as f:
         json.dump(args_dict, f, indent=4)
@@ -132,64 +115,48 @@ if __name__ == "__main__":
         state_dict = torch.load(f"{trial_path}/best_weights.pt", weights_only=False)
         model.module.load_state_dict(state_dict)
 
+    if args.task == "shot_blocking":
+        feature_dir = "data/ajax/features/augmented_shot_graphs"
+        label_dir = "data/ajax/features/augmented_shot_labels"
+    elif args.task == "failure_receiver" and args.augment_blocks:
+        feature_dir = "data/ajax/features/augmented_graphs"
+        label_dir = "data/ajax/features/augmented_labels"
     else:
-        title = f"{args.target} {args.trial:02d} | {args.task} {args.model}"
-        dataset_arg_keys = ["oversampling", "ball_z_aware", "poss_vel_aware", "sparsify"]
-        model_arg_keys = ["node_in_dim", "node_emb_dim", "gnn_heads", "skip_conn", "total_params"]
-        train_arg_keys = ["batch_size", "weight_bce", "lambda_l1", "start_lr", "seed"]
-
-        printlog(title, trial_path)
-        printlog(get_args_str(dataset_arg_keys, args_dict), trial_path)
-        printlog(get_args_str(model_arg_keys, args_dict), trial_path)
-        printlog(get_args_str(train_arg_keys, args_dict), trial_path)
-
-    printlog("############################################################", trial_path)
-
-    print("\nGenerating datasets...")
-    action_type = args.action_type.split("_")[-1] if args.action_type != "pass_shot" else "pass_shot"
-    if args.augment:
-        feature_dir = f"data/ajax/pyg/{action_type}_aug_features"
-    else:
-        feature_dir = f"data/ajax/pyg/{action_type}_features"
-    game_ids = [f.split(".")[0] for f in np.sort(os.listdir(feature_dir)) if f.endswith(".pt")]
+        feature_dir = "data/ajax/features/action_graphs"
+        label_dir = f"data/ajax/features/action_labels_{args.return_type}"
 
     lineups = pd.read_parquet("data/ajax/lineup/line_up.parquet").sort_values("game_date", ignore_index=True)
     lineups["game_date"] = pd.to_datetime(lineups["game_date"])
     lineups["game_id"] = lineups["stats_perform_match_id"]
+    match_dates = lineups[["game_id", "game_date"]].drop_duplicates().set_index("game_id")["game_date"]
 
-    game_dates = lineups[["game_id", "game_date"]].drop_duplicates().set_index("game_id")["game_date"]
+    match_ids = [f.split(".")[0] for f in np.sort(os.listdir(feature_dir)) if f.endswith(".pt")]
+    match_ids = match_dates[(match_dates.index.isin(match_ids)) & (match_dates < datetime(2024, 6, 1))].index
+    train_match_ids = np.sort(np.random.choice(match_ids, 200, replace=False))
+    valid_match_ids = np.sort([id for id in match_ids if id not in train_match_ids])
 
-    np.random.seed(0)
-    game_ids = game_dates[(game_dates.index.isin(game_ids)) & (game_dates < datetime(2024, 6, 1))].index
-    train_game_ids = np.sort(np.random.choice(game_ids, 200, replace=False))
-    valid_game_ids = np.sort([id for id in game_ids if id not in train_game_ids])
-
+    print("Generating datasets...")
     dataset_args = {
         "feature_dir": feature_dir,
-        "label_dir": feature_dir.replace("features", "labels"),
-        "action_type": args.action_type,
-        "intended_only": "intent" in args.target or args.target.startswith("fail"),
-        "inplay_only": args.target.endswith("receiver") and not args.residual,
-        "min_duration": args.min_duration,
+        "label_dir": label_dir,
+        "task": args.task,
+        "inplay_only": args.task.split("_")[1] == "receiver" and not args.include_out,
+        "min_pass_dur": args.min_pass_dur,
+        "shot_success_type": args.shot_success,
         "xy_only": args.xy_only,
         "possessor_aware": args.possessor_aware,
         "keeper_aware": args.keeper_aware,
         "ball_z_aware": args.ball_z_aware,
         "poss_vel_aware": args.poss_vel_aware,
-        "intent_given": intent_given,
-        "drop_opponents": args.target.startswith("oppo_agn"),
+        "extend_features": args.extend_features,
         "drop_non_blockers": args.filter_blockers,
         "sparsify": args.sparsify,
         "max_edge_dist": args.max_edge_dist,
     }
-    train_dataset = ActionDataset(train_game_ids, **dataset_args)
-    valid_dataset = ActionDataset(valid_game_ids, **dataset_args)
+    train_dataset = ActionDataset(train_match_ids, **dataset_args)
+    valid_dataset = ActionDataset(valid_match_ids, **dataset_args)
 
-    if args.action_type == "failed_pass" and args.augment:
-        train_dataset.balance_real_and_augmented()
-        valid_dataset.balance_real_and_augmented()
-
-    if args.target.endswith("_success") and args.weight_bce:
+    if args.task == "pass_success" and args.weight_bce:
         n_positives = train_dataset.labels[train_dataset.labels[:, -5] == 1].shape[0]
         n_negatives = train_dataset.labels[train_dataset.labels[:, -5] == 0].shape[0]
         pos_weight = n_negatives / n_positives
@@ -197,13 +164,16 @@ if __name__ == "__main__":
         pos_weight = 1
 
     loader_args = {"batch_size": args.batch_size, "shuffle": True, "num_workers": 16, "pin_memory": True}
-    if args.oversampling != "none":
-        print("\nCalculating oversampling probabilities...")
-        scores = 1 / estimate_likelihoods(train_dataset, model_id=args.oversampling, device=device)
-        sampling_probs = scores / scores.sum()
-        sampler = WeightedRandomSampler(sampling_probs, num_samples=len(train_dataset) * 2, replacement=True)
-        loader_args["shuffle"] = False
-        loader_args["sampler"] = sampler
+
+    if args.ipw_model_id != "none":
+        print("\nCalculating inverse propensity weights...")
+        inverse_propensity = 1 / estimate_propensity(train_dataset, model_id=args.ipw_model_id, device=device)
+        train_ipw = inverse_propensity / inverse_propensity.mean()
+        train_dataset.set_inverse_propensity_weights(train_ipw)
+
+        inverse_propensity = 1 / estimate_propensity(valid_dataset, model_id=args.ipw_model_id, device=device)
+        valid_ipw = inverse_propensity / inverse_propensity.mean()
+        valid_dataset.set_inverse_propensity_weights(valid_ipw)
 
     train_loader = DataLoader(train_dataset, **loader_args)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=16, pin_memory=True)
@@ -244,26 +214,23 @@ if __name__ == "__main__":
         epoch_time = time.time() - start_time
         printlog("Time:\t {:.2f}s".format(epoch_time), trial_path)
 
-        # valid_loss = sum([value for key, value in valid_metrics.items() if key.endswith("loss")])
-        epoch_metrics = valid_metrics if args.oversampling == "none" else train_metrics
-        epoch_loss = epoch_metrics["ce_loss"]
-        epoch_acc = epoch_metrics["accuracy"] if "accuracy" in valid_metrics else valid_metrics["f1"]
+        epoch_loss = valid_metrics["ce_loss"] if "ce_loss" in valid_metrics else valid_metrics["mse_loss"]
 
         # Best model on test set
         if best_loss == 0 or epoch_loss < best_loss:
             epochs_since_best = 0
             best_loss = epoch_loss
-            if epoch_acc > best_acc:
-                best_acc = epoch_acc
 
             torch.save(model.module.state_dict(), f"{trial_path}/best_weights.pt")
             printlog("######## Best Loss ########", trial_path)
 
-        elif epoch_acc > best_acc:
-            epochs_since_best = 0
-            best_acc = epoch_acc
-
-            torch.save(model.module.state_dict(), f"{trial_path}/best_acc_weights.pt")
-            printlog("###### Best Accuracy ######", trial_path)
+        if "accuracy" in valid_metrics or "f1" in valid_metrics:
+            epoch_acc = valid_metrics["accuracy"] if "accuracy" in valid_metrics else valid_metrics["f1"]
+            if epoch_acc > best_acc:
+                best_acc = epoch_acc
+                if epochs_since_best > 0:
+                    epochs_since_best = 0
+                    torch.save(model.module.state_dict(), f"{trial_path}/best_acc_weights.pt")
+                    printlog("###### Best Accuracy ######", trial_path)
 
     printlog(f"Best loss: {best_loss:.4f}", trial_path)
