@@ -4,17 +4,20 @@
 	</h1>
 </div>
 
-Source code for the paper [Better Prevent than Tackle: Valuing Defense in Soccer Based on Graph Neural Networks](https://arxiv.org/abs/2512.10355) by Kim et al., 2025 (under review).
+Source code for the paper [Better Prevent than Tackle: Valuing Defense in Soccer Based on Graph Neural Networks](https://arxiv.org/abs/2512.10355) by Kim et al., SSAC 2026.
 
-# Introduction
+<br>
+
+## Introduction
 **DEFCON (DEFensive CONtribution evaluator)** is a framework for evaluating the defensive contribution of soccer players in terms of reducing the Expected Possession Value (EPV) of the opposing team in a given situation.
 
 <p align="center">
   <img src="img/main.png" />
 </p>
+
 <br>
 
-# Quick Start
+## Quick Start
 For end-to-end reproduction, follow these steps:
 
 1. Tracking data preprocessing: `python datatools/preprocess.py`
@@ -22,9 +25,10 @@ For end-to-end reproduction, follow these steps:
 3. Training GNN-based component models: `sh scripts/*.sh`
 4. Computing player defensive scores: `python main.py ...`
 5. Match analysis and visualization: `tutorial.ipynb`
+
 <br>
 
-# Data Availability and Preparation
+## Data Availability and Preparation
 This codebase requires tracking data in the [Kloppy](https://kloppy.pysport.org) format and event data in the [SPADL (Decroos et al., 2019)](https://socceraction.readthedocs.io/en/latest/documentation/spadl/spadl.html) format.
 
 The dataset used in this project cannot be publicly released, as it is an internal asset of AFC Ajax. However, users can apply DEFCON to their own datasets by following the same data format.
@@ -67,9 +71,10 @@ For event data, we recommend synchronizing event timestamps with tracking data u
 
 Unlike other component models, UxG is not trained using tracking data. Instead, it is trained on shot events from the [Wyscout open event dataset (Pappalardo et al., 2019)](https://www.nature.com/articles/s41597-019-0247-7), which provides a substantially larger number of shot samples. For reproducibility, we provide the preprocessed shot features and labels used to train the UxG model as a CSV file: `data/event_xg_train.csv`. See **Section 3.2** of the paper for further details.
 </details>
+
 <br>
 
-# Detailed Instructions
+## Detailed Instructions
 The framework estimates seven key components at each moment of action as follows:
 - **(a1) Action selection probability** that the ball possessor selects each teammate as the "intended" receiver or takes a shot.
 - **(b1) Pass success probability** that a pass to each teammate is successful.
@@ -157,12 +162,9 @@ python main.py --result_path data/player_scores.parquet
 The resulting scores will be saved as a Parquet file at the specified path.
 </details>
 
-<details>
-<summary>
-  <strong>
-    6. Match Analysis with Visualization
-  </strong>
-</summary>
+<br>
+
+## Tutorial for Match Analysis and Visualization
 
 The notebook `tutorial.ipynb` provides an end-to-end workflow for match-level analysis using DEFCON. Through this tutorial, you can:
 - Generate features and labels for a single match
@@ -177,21 +179,21 @@ In addition, the notebook allows you to reproduce visualizations presented in th
   <img src="img/sample_probs.png" width=49.4% />
   <img src="img/sample_credits.png" width=48% />
 </p>
-</details>
+
 <br>
 
-# Citation
-If you use this code or any part of it in your research, please consider citing the following paper:
+## Citation
+If you use this code in your research, please consider citing the following paper:
 ```
-@article{Kim2025,
-  author  = {Hyunsung Kim and
-             Sangwoo Seo and
-             Hoyoung Choi and
-             Tom Boomstra and
-             Jinsung Yoon and
-             Chanyoung Park},
-  title   = {Better Prevent than Tackle: Valuing Defense in Soccer Based on Graph Neural Networks},
-  journal = {arXiv preprint arXiv:2512.10355},
-  year    = {2025}
+@inproceedings{KimSCBYP26,
+  author      = {Hyunsung Kim and
+                 Sangwoo Seo and
+                 Hoyoung Choi and
+                 Tom Boomstra and
+                 Jinsung Yoon and
+                 Chanyoung Park},
+  title       = {Better Prevent than Tackle: Valuing Defense in Soccer Based on Graph Neural Networks},
+  booktitle   = {MIT Sloan Sports Analytics Conference},
+  year        = {2026},
 }
 ```
