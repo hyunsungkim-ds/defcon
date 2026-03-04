@@ -17,6 +17,12 @@ Source code for the paper [Better Prevent than Tackle: Valuing Defense in Soccer
 
 <br>
 
+## Architecture
+
+Open [`architecture.html`](architecture.html) in a browser to explore the C4 architecture diagrams (System Context, Container, Training Flow, Inference Flow).
+
+<br>
+
 ## Quick Start
 For end-to-end reproduction, follow these steps:
 
@@ -179,6 +185,12 @@ In addition, the notebook allows you to reproduce visualizations presented in th
   <img src="img/sample_probs.png" width=49.4% />
   <img src="img/sample_credits.png" width=48% />
 </p>
+
+<br>
+
+## License
+
+[Apache License 2.0](LICENSE) &mdash; see [NOTICE](NOTICE) for third-party attribution.
 
 <br>
 
