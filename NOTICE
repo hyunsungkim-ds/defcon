@@ -1,0 +1,60 @@
+DEFCON (DEFensive CONtribution evaluator)
+Copyright 2025 Hyunsung Kim, Sangwoo Seo, Hoyoung Choi, Tom Boomstra,
+Jinsung Yoon, Chanyoung Park
+
+This product includes software and data adapted from third-party sources.
+
+Vendored Libraries
+------------------
+
+matplotsoccer — Soccer pitch visualization (MIT License).
+Copyright (c) Tom Decroos.
+The file datatools/matplotsoccer.py is a modified copy of this package.
+See: https://github.com/TomDecroos/matplotsoccer
+
+Third-Party Data Attribution
+----------------------------
+
+Shot event data for the Unblocked-Shot Expected Goals (UxG) model
+(data/event_xg_train.csv) is derived from the Wyscout public dataset,
+licensed under the Creative Commons Attribution 4.0 International
+(CC-BY 4.0) license.
+Citation: Pappalardo, L. et al. (2019). "A public data set of
+spatio-temporal match events in soccer competitions." Scientific Data,
+Nature.
+See: https://figshare.com/collections/Soccer_match_event_dataset/4415000
+
+Third-Party Libraries
+---------------------
+
+The following open-source libraries are used at runtime but are not
+vendored into this repository:
+
+PyTorch Geometric (PyG) — Graph Neural Network framework (MIT License).
+Copyright (c) PyG Team.
+See: https://github.com/pyg-team/pytorch_geometric
+
+kloppy — Standardizing soccer tracking and event data (BSD-3-Clause License).
+Copyright (c) kloppy contributors.
+See: https://github.com/PySport/kloppy
+
+socceraction — SPADL conversion and action valuation (MIT License).
+Copyright (c) DTAI Research KU Leuven.
+See: https://github.com/ML-KULeuven/socceraction
+
+Academic References
+-------------------
+
+The SPADL action representation and data format conventions follow:
+Decroos, T. et al. (2019). "Actions Speak Louder than Goals: Valuing
+Player Actions in Soccer." Proceedings of the 25th ACM SIGKDD.
+
+The Expected Possession Value (EPV) framework and counterfactual
+evaluation methodology are described in:
+Kim, H. et al. (2026). "Better Prevent than Tackle: Valuing Defense
+in Soccer Based on Graph Neural Networks." MIT Sloan Sports Analytics
+Conference. See: https://arxiv.org/abs/2512.10355
+
+Event-tracking data synchronization references:
+Kim, H. et al. (2025). "ELASTIC: Event-Level Alignment of Synchronized
+Tracking and InferCed data." See: https://arxiv.org/abs/2508.09238
