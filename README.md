@@ -4,7 +4,7 @@
 	</h1>
 </div>
 
-Source code for the paper [Better Prevent than Tackle: Valuing Defense in Soccer Based on Graph Neural Networks](https://arxiv.org/abs/2512.10355) by Kim et al., SSAC 2026.
+Source code for the paper **DEFCON: Defensive Performance Evaluation in Soccer via Decomposed Graph Attention Networks** (under review).
 
 <br>
 
@@ -181,19 +181,3 @@ In addition, the notebook allows you to reproduce visualizations presented in th
 </p>
 
 <br>
-
-## Citation
-If you use this code in your research, please consider citing the following paper:
-```
-@inproceedings{KimSCBYP26,
-  author      = {Hyunsung Kim and
-                 Sangwoo Seo and
-                 Hoyoung Choi and
-                 Tom Boomstra and
-                 Jinsung Yoon and
-                 Chanyoung Park},
-  title       = {Better Prevent than Tackle: Valuing Defense in Soccer Based on Graph Neural Networks},
-  booktitle   = {MIT Sloan Sports Analytics Conference},
-  year        = {2026},
-}
-```
