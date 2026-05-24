@@ -31,7 +31,7 @@ For end-to-end reproduction, follow these steps:
 ## Data Availability and Preparation
 This codebase requires tracking data in the [Kloppy](https://kloppy.pysport.org) format and event data in the [SPADL (Decroos et al., 2019)](https://socceraction.readthedocs.io/en/latest/documentation/spadl/spadl.html) format.
 
-The dataset used in this project cannot be publicly released, as it is an internal asset of AFC Ajax. However, users can apply DEFCON to their own datasets by following the same data format.
+The dataset used in this project cannot be publicly released, as it is an internal asset of a professional club. However, users can apply DEFCON to their own datasets by following the same data format.
 
 The current implementation assumes the following directory structure:
 - Tracking data: per-match Parquet files in `data/ajax/tracking/`
