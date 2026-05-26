@@ -16,8 +16,8 @@ class ActionDataset(Dataset):
     def __init__(
         self,
         match_ids,
-        feature_dir="data/ajax/features/action_graphs",
-        label_dir="data/ajax/features/action_labels_disc_0.9",
+        feature_dir="data/eredivisie/features/action_graphs",
+        label_dir="data/eredivisie/features/action_labels_disc_0.9",
         task=None,
         inplay_only=False,
         min_pass_dur=0.0,

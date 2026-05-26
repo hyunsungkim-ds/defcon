@@ -58,14 +58,14 @@ if __name__ == "__main__":
     parser.add_argument("--return_type", type=str, default="disc_0.9", help="Way of defining future xG.")
     args = parser.parse_args()
 
-    feature_dir = Path(f"data/ajax/features/{args.action_type}_graphs")
-    output_dir = Path(f"data/ajax/features/{args.action_type}_tabular")
+    feature_dir = Path(f"data/eredivisie/features/{args.action_type}_graphs")
+    output_dir = Path(f"data/eredivisie/features/{args.action_type}_tabular")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.action_type == "all":
-        label_dir = Path(f"data/ajax/features/action_labels_{args.return_type}")
+        label_dir = Path(f"data/eredivisie/features/action_labels_{args.return_type}")
     else:
-        label_dir = Path(f"data/ajax/features/{args.action_type}_labels")
+        label_dir = Path(f"data/eredivisie/features/{args.action_type}_labels")
 
     label_paths = sorted(label_dir.glob("*.pt"))
     if not label_paths:

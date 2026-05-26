@@ -19,8 +19,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--shot_success", type=str, default="unblocked", choices=["goal", "on_target", "unblocked"])
     parser.add_argument("--load_saved", action="store_true", default=False, help="load saved components")
-    parser.add_argument("--component_path", type=str, required=False, default="data/ajax/defcon_components")
-    parser.add_argument("--result_path", type=str, required=False, default="data/ajax/player_scores.parquet")
+    parser.add_argument("--component_path", type=str, required=False, default="data/eredivisie/defcon_components")
+    parser.add_argument("--result_path", type=str, required=False, default="data/eredivisie/player_scores.parquet")
     args, _ = parser.parse_known_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -42,10 +42,10 @@ if __name__ == "__main__":
     else:  # args.shot_success in ["goal", "on_target"]
         defcon_args["shot_xg_model_id"] = "shot_success/01"
 
-    event_files = np.sort(os.listdir("data/ajax/event_synced"))
+    event_files = np.sort(os.listdir("data/eredivisie/event_synced"))
     match_ids = np.sort([f.split(".")[0] for f in event_files if f.endswith(".csv")])
 
-    lineups = pd.read_parquet("data/ajax/lineup/line_up.parquet").sort_values("game_date", ignore_index=True)
+    lineups = pd.read_parquet("data/eredivisie/lineup/line_up.parquet").sort_values("game_date", ignore_index=True)
     lineups["game_id"] = lineups["stats_perform_match_id"]
     lineups["game_date"] = pd.to_datetime(lineups["game_date"])
     match_dates = lineups[["game_id", "game_date"]].drop_duplicates().set_index("game_id")["game_date"]
@@ -54,8 +54,8 @@ if __name__ == "__main__":
     n_test_matches = len(test_match_ids)
 
     for i, match_id in enumerate(test_match_ids):
-        events = pd.read_csv(f"data/ajax/event_synced/{match_id}.csv", header=0, parse_dates=["utc_timestamp"])
-        tracking = pd.read_parquet(f"data/ajax/tracking_processed/{match_id}.parquet")
+        events = pd.read_csv(f"data/eredivisie/event_synced/{match_id}.csv", header=0, parse_dates=["utc_timestamp"])
+        tracking = pd.read_parquet(f"data/eredivisie/tracking_processed/{match_id}.parquet")
         match_lineup = lineups.loc[lineups["stats_perform_match_id"] == match_id]
 
         match_date = match_lineup["game_date"].iloc[0].date()
@@ -65,8 +65,10 @@ if __name__ == "__main__":
         match = Match(events, tracking, match_lineup, action_type="all", include_goals=True)
         print("Constructing labels...")
         match.labels = match.construct_labels(discount_xg=True)
-        match.graph_features_0 = torch.load(f"data/ajax/features/action_graphs/{match_id}.pt", weights_only=False)
-        match.graph_features_1 = torch.load(f"data/ajax/features/post_action_graphs/{match_id}.pt", weights_only=False)
+
+        feat_dir = "data/eredivisie/features"
+        match.graph_features_0 = torch.load(f"{feat_dir}/action_graphs/{match_id}.pt", weights_only=False)
+        match.graph_features_1 = torch.load(f"{feat_dir}/post_action_graphs/{match_id}.pt", weights_only=False)
         match.actions = match.label_post_actions(match.actions)
 
         if args.shot_success in ["goal", "on_target"]:

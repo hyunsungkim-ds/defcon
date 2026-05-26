@@ -188,7 +188,7 @@ def main():
     all_df["position"] = all_df["position"].astype("string")
     all_df["market_value"] = all_df["market_value"].astype("string")
 
-    out_path = "data/ajax/transfermarkt_2425.csv"
+    out_path = "data/eredivisie/transfermarkt_2425.csv"
     all_df.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\nSaved {len(all_df):,} rows -> {out_path}")
 

@@ -150,8 +150,8 @@ def calc_physical_features(tracking: pd.DataFrame, fps=25) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    EVENT_PATH = "data/ajax/event/event_v3.parquet"
-    TRACKING_DIR = "data/ajax/tracking_v3"
+    EVENT_PATH = "data/eredivisie/event/event_v3.parquet"
+    TRACKING_DIR = "data/eredivisie/tracking_v3"
 
     events = pd.read_parquet(EVENT_PATH)
     events["utc_timestamp"] = pd.to_datetime(events["time_stamp"])
@@ -162,14 +162,14 @@ if __name__ == "__main__":
     match_dates = events[["stats_perform_match_id", "game_date"]].drop_duplicates()
     match_counts = match_dates["stats_perform_match_id"].value_counts()
     match_ids = match_counts[match_counts == 1].index
-    os.makedirs("data/ajax/tracking_processed", exist_ok=True)
+    os.makedirs("data/eredivisie/tracking_processed", exist_ok=True)
 
     for i, match_id in enumerate(match_ids[-1:]):
-        if not os.path.exists(f"data/ajax/tracking_v3/{match_id}_new.parquet"):
+        if not os.path.exists(f"data/eredivisie/tracking_v3/{match_id}_new.parquet"):
             continue
 
         print(f"\n[{i}] {match_id}")
-        tracking = pd.read_parquet(f"data/ajax/tracking_v3/{match_id}_new.parquet")
+        tracking = pd.read_parquet(f"data/eredivisie/tracking_v3/{match_id}_new.parquet")
 
         tracking[["timestamp", "ball_x", "ball_y"]] = tracking[["timestamp", "ball_x", "ball_y"]].round(2)
         tracking["ball_z"] = (tracking["ball_z"].astype(float) / 100).round(2)  # centimeters to meters
@@ -177,4 +177,4 @@ if __name__ == "__main__":
         tracking = label_frames_and_episodes(tracking)
         tracking = calc_physical_features(tracking)
 
-        tracking.to_parquet(f"data/ajax/tracking_processed/{match_id}.parquet")
+        tracking.to_parquet(f"data/eredivisie/tracking_processed/{match_id}.parquet")

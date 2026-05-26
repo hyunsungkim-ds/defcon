@@ -244,15 +244,15 @@ if __name__ == "__main__":
     parser.add_argument("--augment", action="store_true", default=False, help="augment failed shots by far passes")
     args, _ = parser.parse_known_args()
 
-    feature_dir = f"data/ajax/features/{args.action_type}_tabular"
-    label_dir = f"data/ajax/features/{args.action_type}_labels"
+    feature_dir = f"data/eredivisie/features/{args.action_type}_tabular"
+    label_dir = f"data/eredivisie/features/{args.action_type}_labels"
     os.makedirs(feature_dir, exist_ok=True)
     os.makedirs(label_dir, exist_ok=True)
 
-    event_files = np.sort(os.listdir("data/ajax/event_synced"))
+    event_files = np.sort(os.listdir("data/eredivisie/event_synced"))
     match_ids = np.sort([f.split(".")[0] for f in event_files if f.endswith(".csv")])
 
-    lineups = pd.read_parquet("data/ajax/lineup/line_up.parquet")
+    lineups = pd.read_parquet("data/eredivisie/lineup/line_up.parquet")
     lineups["game_id"] = lineups["stats_perform_match_id"]
     lineups["game_date"] = pd.to_datetime(lineups["game_date"])
     match_dates = lineups[["game_id", "game_date"]].drop_duplicates().set_index("game_id")["game_date"]
@@ -273,8 +273,8 @@ if __name__ == "__main__":
         labels = []
 
     for i, match_id in enumerate(match_ids):
-        events = pd.read_csv(f"data/ajax/event_synced/{match_id}.csv", header=0, parse_dates=["utc_timestamp"])
-        tracking = pd.read_parquet(f"data/ajax/tracking_processed/{match_id}.parquet")
+        events = pd.read_csv(f"data/eredivisie/event_synced/{match_id}.csv", header=0, parse_dates=["utc_timestamp"])
+        tracking = pd.read_parquet(f"data/eredivisie/tracking_processed/{match_id}.parquet")
         match_lineup = lineups.loc[lineups["stats_perform_match_id"] == match_id]
 
         match = Match(events, tracking, match_lineup, action_type, include_goals=False)

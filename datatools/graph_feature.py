@@ -315,31 +315,31 @@ if __name__ == "__main__":
 
     if args.action_type.startswith("shot"):
         args.action_type = "shot_augment"
-        feature_dir = "data/ajax/features/augmented_shot_graphs"
-        label_dir = "data/ajax/features/augmented_shot_labels"
+        feature_dir = "data/eredivisie/features/augmented_shot_graphs"
+        label_dir = "data/eredivisie/features/augmented_shot_labels"
         os.makedirs(feature_dir, exist_ok=True)
         os.makedirs(label_dir, exist_ok=True)
 
     else:  # args.actions_type == "all"
-        feature_dir = "data/ajax/features/action_graphs"
-        label_dir = f"data/ajax/features/action_labels_{args.return_type}"
+        feature_dir = "data/eredivisie/features/action_graphs"
+        label_dir = f"data/eredivisie/features/action_labels_{args.return_type}"
         os.makedirs(feature_dir, exist_ok=True)
         os.makedirs(label_dir, exist_ok=True)
 
         if args.post_action:
-            post_feature_dir = "data/ajax/features/post_action_graphs"
+            post_feature_dir = "data/eredivisie/features/post_action_graphs"
             os.makedirs(post_feature_dir, exist_ok=True)
 
     if args.augment_blocks:
-        augmented_feature_dir = "data/ajax/features/augmented_graphs"
-        augmented_label_dir = "data/ajax/features/augmented_labels"
+        augmented_feature_dir = "data/eredivisie/features/augmented_graphs"
+        augmented_label_dir = "data/eredivisie/features/augmented_labels"
         os.makedirs(augmented_feature_dir, exist_ok=True)
         os.makedirs(augmented_label_dir, exist_ok=True)
 
-    event_files = np.sort(os.listdir("data/ajax/event_synced"))
+    event_files = np.sort(os.listdir("data/eredivisie/event_synced"))
     match_ids = np.sort([f.split(".")[0] for f in event_files if f.endswith(".csv")])
 
-    lineups = pd.read_parquet("data/ajax/lineup/line_up.parquet")
+    lineups = pd.read_parquet("data/eredivisie/lineup/line_up.parquet")
     lineups["game_id"] = lineups["stats_perform_match_id"]
     lineups["game_date"] = pd.to_datetime(lineups["game_date"])
     match_dates = lineups[["game_id", "game_date"]].drop_duplicates().set_index("game_id")["game_date"]
@@ -352,8 +352,8 @@ if __name__ == "__main__":
     n_matches = len(match_ids)
 
     for i, match_id in enumerate(match_ids):
-        events = pd.read_csv(f"data/ajax/event_synced/{match_id}.csv", header=0, parse_dates=["utc_timestamp"])
-        tracking = pd.read_parquet(f"data/ajax/tracking_processed/{match_id}.parquet")
+        events = pd.read_csv(f"data/eredivisie/event_synced/{match_id}.csv", header=0, parse_dates=["utc_timestamp"])
+        tracking = pd.read_parquet(f"data/eredivisie/tracking_processed/{match_id}.parquet")
         match_lineup = lineups.loc[lineups["stats_perform_match_id"] == match_id]
 
         match = Match(events, tracking, match_lineup, args.action_type, include_goals=True)

@@ -116,16 +116,16 @@ if __name__ == "__main__":
         model.module.load_state_dict(state_dict)
 
     if args.task == "shot_blocking":
-        feature_dir = "data/ajax/features/augmented_shot_graphs"
-        label_dir = "data/ajax/features/augmented_shot_labels"
+        feature_dir = "data/eredivisie/features/augmented_shot_graphs"
+        label_dir = "data/eredivisie/features/augmented_shot_labels"
     elif args.task == "failure_receiver" and args.augment_blocks:
-        feature_dir = "data/ajax/features/augmented_graphs"
-        label_dir = "data/ajax/features/augmented_labels"
+        feature_dir = "data/eredivisie/features/augmented_graphs"
+        label_dir = "data/eredivisie/features/augmented_labels"
     else:
-        feature_dir = "data/ajax/features/action_graphs"
-        label_dir = f"data/ajax/features/action_labels_{args.return_type}"
+        feature_dir = "data/eredivisie/features/action_graphs"
+        label_dir = f"data/eredivisie/features/action_labels_{args.return_type}"
 
-    lineups = pd.read_parquet("data/ajax/lineup/line_up.parquet").sort_values("game_date", ignore_index=True)
+    lineups = pd.read_parquet("data/eredivisie/lineup/line_up.parquet").sort_values("game_date", ignore_index=True)
     lineups["game_date"] = pd.to_datetime(lineups["game_date"])
     lineups["game_id"] = lineups["stats_perform_match_id"]
     match_dates = lineups[["game_id", "game_date"]].drop_duplicates().set_index("game_id")["game_date"]

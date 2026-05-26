@@ -8,7 +8,7 @@ Source code for the paper **DEFCON: Defensive Performance Evaluation in Soccer v
 
 <br>
 
-## Introduction
+# Introduction
 **DEFCON (DEFensive CONtribution evaluator)** is a framework for evaluating the defensive contribution of soccer players in terms of reducing the Expected Possession Value (EPV) of the opposing team in a given situation.
 
 <p align="center">
@@ -17,7 +17,7 @@ Source code for the paper **DEFCON: Defensive Performance Evaluation in Soccer v
 
 <br>
 
-## Quick Start
+# Quick Start
 For end-to-end reproduction, follow these steps:
 
 1. Tracking data preprocessing: `python datatools/preprocess.py`
@@ -28,15 +28,15 @@ For end-to-end reproduction, follow these steps:
 
 <br>
 
-## Data Availability and Preparation
+# Data Availability and Preparation
 This codebase requires tracking data in the [Kloppy](https://kloppy.pysport.org) format and event data in the [SPADL (Decroos et al., 2019)](https://socceraction.readthedocs.io/en/latest/documentation/spadl/spadl.html) format.
 
 The dataset used in this project cannot be publicly released, as it is an internal asset of a professional club. However, users can apply DEFCON to their own datasets by following the same data format.
 
 The current implementation assumes the following directory structure:
-- Tracking data: per-match Parquet files in `data/ajax/tracking/`
-- Event data: Per-match Parquet files at `data/ajax/event_synced/`
-- Match lineups: A single parquet file at `data/ajax/lineup/line_up.parquet`
+- Tracking data: per-match Parquet files in `data/eredivisie/tracking/`
+- Event data: Per-match Parquet files at `data/eredivisie/event_synced/`
+- Match lineups: A single parquet file at `data/eredivisie/lineup/line_up.parquet`
 
 <details>
 <summary>
@@ -49,7 +49,7 @@ Running the following command performs preprocessing on the raw Kloppy-format tr
 ```
 python datatools/preprocess.py
 ```
-This step includes basic cleaning as well as the computation of kinematic features such as player velocity and acceleration. The processed tracking data are saved to `data/ajax/tracking_processed/` and are used for subsequent feature extraction.
+This step includes basic cleaning as well as the computation of kinematic features such as player velocity and acceleration. The processed tracking data are saved to `data/eredivisie/tracking_processed/` and are used for subsequent feature extraction.
 </details>
 
 <details>
@@ -59,7 +59,7 @@ This step includes basic cleaning as well as the computation of kinematic featur
   </strong>
 </summary>
 
-For event data, we recommend synchronizing event timestamps with tracking data using [ELASTIC (Kim et al., 2025)](https://arxiv.org/abs/2508.09238) before use. This ensures frame-level alignment between event annotations and tracking data, which is crucial for accurately estimating component values. The synchronized event data should be stored in `data/ajax/event_synced/`.
+For event data, we recommend synchronizing event timestamps with tracking data using [ELASTIC (Kim et al., 2025)](https://arxiv.org/abs/2508.09238) before use. This ensures frame-level alignment between event annotations and tracking data, which is crucial for accurately estimating component values. The synchronized event data should be stored in `data/eredivisie/event_synced/`.
 </details>
 
 <details>
@@ -74,7 +74,7 @@ Unlike other component models, UxG is not trained using tracking data. Instead, 
 
 <br>
 
-## Detailed Instructions
+# Detailed Instructions
 The framework estimates seven key components at each moment of action as follows:
 - **(a1) Action selection probability** that the ball possessor selects each teammate as the "intended" receiver or takes a shot.
 - **(b1) Pass success probability** that a pass to each teammate is successful.
@@ -102,7 +102,7 @@ The specific commands for generating training features and labels are:
 - Defender responsbility: `python datatools/graph_feature.py --action_type all --split train --augment_blocks`
 - Other components: `python datatools/graph_feature.py --action_type all --split train`
 
-The resulting features and labels are saved to `data/ajax/features/`.
+The resulting features and labels are saved to `data/eredivisie/features/`.
 
 For test data generation, replace `--split train` with `--split test --post_action` in the above commands. The `--post_action` flag is required to extract features **after** each action in the test data, which are later used for computing defensive scores.
 </details>
@@ -164,20 +164,37 @@ The resulting scores will be saved as a Parquet file at the specified path.
 
 <br>
 
-## Tutorial for Match Analysis and Visualization
+# Tutorial for Match Analysis with Visualization
 
 The notebook `tutorial.ipynb` provides an end-to-end workflow for match-level analysis using DEFCON. Through this tutorial, you can:
+
 - Generate features and labels for a single match
 - Estimate component values using trained models
-- Compute player-level defensive scores, corresponding to Figure 6 of the paper
+- Aggregate players' match-wide defensive scores (Fig. 4)
 <p align="center">
-  <img src="img/score_plot.png" width="80%" />
+  <img src="img/match_credits.png" width="80%" />
 </p>
 
-In addition, the notebook allows you to reproduce visualizations presented in the paper, including component value estimates (Figure 2) and defensive credits (Figure 3) for inspecting individual moments.
+In addition, the notebook allows you to reproduce other visualizations presented in the paper, including:
+
+- Component probabilities (Fig. 2) and defensive credits (Fig. 3) of individual moments.
 <p align="center">
-  <img src="img/sample_probs.png" width=49.4% />
+  <img src="img/sample_probs.png" width=50% />
   <img src="img/sample_credits.png" width=48% />
+</p>
+
+- Spatial heatmaps for credit gain and loss (Fig. 7)
+<p align="center">
+  <img src="img/heatmaps.png" width="90%" />
+</p>
+
+- Pairwise attacker-defender analysis (Fig. 8–9)
+<p align="center">
+  <img src="img/pairwise.png" width="90%" />
+</p>
+<p align="center">
+  <img src="img/penalty_away_1.png" width=45% />
+  <img src="img/penalty_away_2.png" width=45% />
 </p>
 
 <br>

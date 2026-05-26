@@ -1,7 +1,8 @@
 # Experimental data and code files
 anim/
 saved/
-data/ajax
+data/eredivisie
+img/*.pdf
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

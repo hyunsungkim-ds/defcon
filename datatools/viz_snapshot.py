@@ -162,9 +162,10 @@ class SnapshotVisualizer:
         cmax=0.05,
         annot_type=None,
         hm_cmap="jet",
+        save_path: str = None,
     ):
         if focus_xy is None:
-            figsize = (13.5, 9.0) if half is None else (10.4, 14.4)  # (9, 6)
+            figsize = (9, 6)
         else:
             figsize = (4, 5)
 
@@ -265,7 +266,7 @@ class SnapshotVisualizer:
             sm.set_array([])
 
             cbar = fig.colorbar(sm, ax=ax)
-            cbar.set_label("Defender responsibility", fontsize=25, rotation=-90, labelpad=25)
+            # cbar.set_label("Defender responsibility", fontsize=25, rotation=-90, labelpad=25)
             cbar.ax.tick_params(labelsize=20)
 
         if self.edges is not None:
@@ -326,5 +327,8 @@ class SnapshotVisualizer:
             ball_y = snapshot["ball_y"].values
             ax.scatter(ball_x[-1], ball_y[-1], s=200, c="w", edgecolors="k", marker="o", zorder=5)
             ax.plot(ball_x[-30:], ball_y[-30:], "k", zorder=3)
+
+        if save_path is not None:
+            fig.savefig(save_path, bbox_inches="tight")
 
         plt.show()

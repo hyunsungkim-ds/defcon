@@ -650,6 +650,7 @@ class DEFCON:
         color=None,
         annot=None,
         show_edges=False,
+        save_path: str = None,
     ) -> pd.DataFrame:
         if post_event:
             frame = self.actions.at[event_index, "end_frame_id"]
@@ -695,13 +696,13 @@ class DEFCON:
                     node_marks["gold"] = [next_player_id]
                 elif next_type not in config.SET_PIECE_OOP:
                     node_marks["gold"] = [receiver]
-            else:
-                arrows = []
+            # else:
+            #     arrows = []
 
         else:
             hypo_target = f"{possessor[:4]}_goal" if hypo_target == -1 else f"{possessor[:4]}_{hypo_target}"
             node_marks = dict() if hypo_target.endswith("_goal") else {"black": [hypo_target]}
-            arrows = [(target, hypo_target)] if spadl_type == "tackle" else [(possessor, hypo_target)]
+            # arrows = [(target, hypo_target)] if spadl_type == "tackle" else [(possessor, hypo_target)]
 
         if "posterior" in [size, color, annot]:
             target = self.actions.at[event_index, "intent_id"] if hypo_target is None else hypo_target
@@ -752,7 +753,7 @@ class DEFCON:
         min_sizes = defaultdict(lambda: 500, style_args["min_size"].to_dict())
         max_sizes = defaultdict(lambda: 20500, style_args["max_size"].to_dict())
         min_colors = defaultdict(lambda: 0.0, style_args["min_color"].to_dict())
-        max_colors = defaultdict(lambda: 0.05, style_args["max_color"].to_dict())
+        max_colors = defaultdict(lambda: 0.03, style_args["max_color"].to_dict())
 
         viz = SnapshotVisualizer(**data_args)
         viz.plot(
@@ -761,11 +762,12 @@ class DEFCON:
             cmin=min_colors[color],
             cmax=max_colors[color],
             annot_type=annot,
+            save_path=save_path,
         )
 
         return values.round(4) if isinstance(values, pd.DataFrame) else None
 
-    def load_components(self, result_dir="data/ajax/defcon_components"):
+    def load_components(self, result_dir="data/eredivisie/defcon_components"):
         match_id = self.match.lineup["stats_perform_match_id"].iloc[0]
 
         self.select_probs_0 = pd.read_parquet(f"{result_dir}/{match_id}/select_probs_0.parquet")
@@ -784,7 +786,7 @@ class DEFCON:
 
         self.posteriors = pd.read_parquet(f"{result_dir}/{match_id}/posteriors.parquet")
 
-    def save_components(self, result_dir="data/ajax/defcon_components"):
+    def save_components(self, result_dir="data/eredivisie/defcon_components"):
         match_id = self.match.lineup["stats_perform_match_id"].iloc[0]
         os.makedirs(f"{result_dir}/{match_id}", exist_ok=True)
 
